@@ -395,7 +395,7 @@ elif st.session_state.page == "review":
     st.markdown(f"**{len(pending)} classification(s) pending review**")
     st.divider()
 
-    for rec in pending:
+    for idx, rec in enumerate(pending):
         row_id  = rec.get("row_id","?")
         ts      = rec.get("timestamp","")
         user    = rec.get("user","")
@@ -427,13 +427,13 @@ elif st.session_state.page == "review":
             col_v, col_c = st.columns([1,3])
             with col_v:
                 verdict = st.selectbox("Verdict", ["CONFIRMED", "REJECTED", "NEEDS_MORE_INFO"],
-                                       key=f"verdict_{row_id}")
+                                       key=f"verdict_{idx}_{row_id}")
             with col_c:
                 comment = st.text_input("Comment (optional — shown on future matches)",
-                                        key=f"comment_{row_id}",
+                                        key=f"comment_{idx}_{row_id}",
                                         placeholder="e.g. Confirmed after checking TARIC chapter note 3(b)")
 
-            if st.button(f"✔  Submit review", key=f"submit_{row_id}"):
+            if st.button(f"✔  Submit review", key=f"submit_{idx}_{row_id}"):
                 try:
                     save_senior_review(
                         row_id       = row_id,
