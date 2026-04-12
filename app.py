@@ -252,7 +252,7 @@ if run_btn:
     # ── EINDVONNIS ────────────────────────────────────────────────────────────
     outcome  = json3.get("validation_outcome","UNKNOWN") if json3 else "UNKNOWN"
     code     = (json3 or {}).get("validated_code","") or (json2 or {}).get("cn_code","")
-    taric    = (json2 or {}).get("taric_code","")
+    taric    = (json3 or {}).get("taric_code","") or (json2 or {}).get("taric_code","")
     manual   = bool((json3 or {}).get("manual_review_recommended") or
                     (json2 or {}).get("manual_review_recommended"))
     issues   = (json3 or {}).get("issues",[])

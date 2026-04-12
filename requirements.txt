@@ -1,6 +1,5 @@
-streamlit>=1.35.0
-anthropic>=0.25.0
-gspread>=6.0.0
-google-auth>=2.29.0
-google-auth-oauthlib>=1.2.0
-Pillow>=10.0.0
+streamlit
+anthropic
+gspread
+google-auth
+Pillow
