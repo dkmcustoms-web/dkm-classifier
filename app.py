@@ -129,15 +129,19 @@ def verdict_html(outcome, code, taric, manual, issues, verified_by=None, cn_desc
         code_str += f" / {taric}"
     desc_str = ""
     if cn_desc:
-        desc_str += f"<div style='font-size:0.85rem;color:#ccc;margin-top:6px;'>{cn_desc}</div>"
-    if taric_desc and taric_desc != cn_desc:
-        desc_str += f"<div style='font-size:0.78rem;color:#999;margin-top:2px;'>{taric_desc}</div>"
+        sub = taric_desc if taric_desc and taric_desc != cn_desc else ""
+        desc_str = f"<span style='font-size:0.95rem;color:#ccc;margin-left:16px;vertical-align:middle;'>{cn_desc}"
+        if sub:
+            desc_str += f" <span style='color:#888;font-size:0.82rem;'>· {sub}</span>"
+        desc_str += "</span>"
     issues_str = ("<br><small style='color:#aaa'>Issues: " + "; ".join(issues) + "</small>") if issues else ""
     manual_str = "" if verified_by else ("<br><small style='color:#f0a030'>⚠ Manual review recommended</small>" if manual else "")
     return f"""<div class='{css}'>
         <div style='font-size:0.8rem;font-weight:600;letter-spacing:0.06em;
                     text-transform:uppercase;margin-bottom:0.5rem;'>{icon} {label}</div>
-        <div class='cn-code'>{code_str}</div>{desc_str}{manual_str}{issues_str}</div>"""
+        <div style='display:flex;align-items:center;flex-wrap:wrap;gap:8px;'>
+            <div class='cn-code'>{code_str}</div>{desc_str}
+        </div>{manual_str}{issues_str}</div>"""
 
 def build_decision_tree(description, specs, json1, json2, json3, raw2) -> str:
     lines = ["CLASSIFICATION DECISION TREE", "=" * 60]
@@ -229,7 +233,7 @@ if st.session_state.page == "classify":
         img_file = st.file_uploader("Product image (optional)", type=["jpg","jpeg","jfif","png","webp"])
         inv_file = st.file_uploader("Invoice document / image (optional)", type=["jpg","jpeg","png","webp","pdf"])
         if img_file:
-            st.image(img_file, caption="Product image", use_container_width=True)
+            st.image(img_file, caption="Product image", width=300)
 
     run_btn = st.button("🔍  Classify product", use_container_width=True)
 
