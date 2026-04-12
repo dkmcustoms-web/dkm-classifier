@@ -1,5 +1,0 @@
-streamlit
-anthropic
-gspread
-google-auth
-Pillow
