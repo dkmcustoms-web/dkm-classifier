@@ -287,7 +287,9 @@ if run_btn:
                       st.secrets["GOOGLE_SERVICE_ACCOUNT"])
         st.success("✓ Opgeslagen in Google Sheets")
     except Exception as e:
-        st.warning(f"Sheets logging mislukt: {e}")
+        import traceback
+        st.warning(f"Sheets logging mislukt: {type(e).__name__}: {e}")
+        st.code(traceback.format_exc(), language="text")
 
     # ── Sla op in session history ─────────────────────────────────────────────
     st.session_state.history.append({
