@@ -221,7 +221,7 @@ if st.session_state.page == "classify":
         specs = st.text_area("Technical specifications (optional)", height=80,
             placeholder="Material composition, power, dimensions, standards...")
     with col2:
-        img_file = st.file_uploader("Product image (optional)", type=["jpg","jpeg","png","webp"])
+        img_file = st.file_uploader("Product image (optional)", type=["jpg","jpeg","jfif","png","webp"])
         inv_file = st.file_uploader("Invoice document / image (optional)", type=["jpg","jpeg","png","webp","pdf"])
         if img_file:
             st.image(img_file, caption="Product image", use_container_width=True)
