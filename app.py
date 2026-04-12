@@ -115,7 +115,7 @@ def call_claude(system: str, user_content) -> str:
     )
     return "".join(b.text for b in resp.content if hasattr(b, "text"))
 
-def verdict_html(outcome, code, taric, manual, issues, verified_by=None):
+def verdict_html(outcome, code, taric, manual, issues, verified_by=None, cn_desc="", taric_desc=""):
     if verified_by:
         css, icon, label = "verdict-verified", "✓✓", f"Verified by previous inquiry ({verified_by})"
     elif "NOT VALIDATED" in outcome:
@@ -127,12 +127,17 @@ def verdict_html(outcome, code, taric, manual, issues, verified_by=None):
     code_str   = code or "—"
     if taric and taric != code:
         code_str += f" / {taric}"
+    desc_str = ""
+    if cn_desc:
+        desc_str += f"<div style='font-size:0.85rem;color:#ccc;margin-top:6px;'>{cn_desc}</div>"
+    if taric_desc and taric_desc != cn_desc:
+        desc_str += f"<div style='font-size:0.78rem;color:#999;margin-top:2px;'>{taric_desc}</div>"
     issues_str = ("<br><small style='color:#aaa'>Issues: " + "; ".join(issues) + "</small>") if issues else ""
     manual_str = "" if verified_by else ("<br><small style='color:#f0a030'>⚠ Manual review recommended</small>" if manual else "")
     return f"""<div class='{css}'>
         <div style='font-size:0.8rem;font-weight:600;letter-spacing:0.06em;
                     text-transform:uppercase;margin-bottom:0.5rem;'>{icon} {label}</div>
-        <div class='cn-code'>{code_str}</div>{manual_str}{issues_str}</div>"""
+        <div class='cn-code'>{code_str}</div>{desc_str}{manual_str}{issues_str}</div>"""
 
 def build_decision_tree(description, specs, json1, json2, json3, raw2) -> str:
     lines = ["CLASSIFICATION DECISION TREE", "=" * 60]
@@ -324,7 +329,9 @@ if st.session_state.page == "classify":
         if verified_match and verified_match.get("cn_code") == code:
             verified_by = f"{verified_match.get('senior_user','senior')} on {verified_match.get('senior_timestamp','')[:10]}"
 
-        st.markdown(verdict_html(outcome, code, taric, manual, issues, verified_by), unsafe_allow_html=True)
+        cn_desc    = (json2 or {}).get("cn_description","")
+        taric_desc = (json2 or {}).get("taric_description","")
+        st.markdown(verdict_html(outcome, code, taric, manual, issues, verified_by, cn_desc, taric_desc), unsafe_allow_html=True)
 
         # ── DECISION TREE ──────────────────────────────────────────────────────
         decision_tree = build_decision_tree(description, specs, json1, json2, json3, raw2)
