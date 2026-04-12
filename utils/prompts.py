@@ -149,6 +149,8 @@ Then at the very end return ONLY valid JSON - no markdown fences:
 {
   "cn_code": "",
   "taric_code": "",
+  "cn_description": "",
+  "taric_description": "",
   "candidate_headings": [],
   "confidence": "HIGH/MEDIUM/LOW",
   "warnings": [],
