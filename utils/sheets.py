@@ -74,14 +74,14 @@ def get_pending_reviews(spreadsheet_id: str, service_account_info) -> list[dict]
     """Return all rows in History that have not yet been senior-reviewed."""
     ss    = _open_ss(spreadsheet_id, service_account_info)
     sheet = _get_or_create_sheet(ss, "History", HEADERS_HISTORY)
-    records = sheet.get_all_records()
+    records = sheet.get_all_records(expected_headers=HEADERS_HISTORY)
     return [r for r in records if str(r.get("senior_reviewed","")).strip().lower() != "yes"]
 
 
 def get_all_history(spreadsheet_id: str, service_account_info) -> list[dict]:
     ss    = _open_ss(spreadsheet_id, service_account_info)
     sheet = _get_or_create_sheet(ss, "History", HEADERS_HISTORY)
-    return sheet.get_all_records()
+    return sheet.get_all_records(expected_headers=HEADERS_HISTORY)
 
 
 def save_senior_review(row_id: str, verdict: str, comment: str,
@@ -91,7 +91,7 @@ def save_senior_review(row_id: str, verdict: str, comment: str,
     """Write senior verdict back to History row and optionally add to Verified sheet."""
     ss      = _open_ss(spreadsheet_id, service_account_info)
     history = _get_or_create_sheet(ss, "History", HEADERS_HISTORY)
-    records = history.get_all_records()
+    records = history.get_all_records(expected_headers=HEADERS_HISTORY)
     now     = datetime.now_str()
 
     # Find and update the row in History
@@ -120,7 +120,7 @@ def lookup_verified(description: str, spreadsheet_id: str, service_account_info)
     """Check if a similar product was already verified by a senior."""
     ss       = _open_ss(spreadsheet_id, service_account_info)
     verified = _get_or_create_sheet(ss, "Verified", HEADERS_VERIFIED)
-    records  = verified.get_all_records()
+    records  = verified.get_all_records(expected_headers=HEADERS_VERIFIED)
     fingerprint = _make_fingerprint(description)
     for rec in records:
         if rec.get("product_fingerprint","") == fingerprint:
