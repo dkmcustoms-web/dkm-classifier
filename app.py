@@ -439,6 +439,64 @@ if st.session_state.page == "classify":
                                          cn_desc=cn_desc, taric_desc=taric_desc),
                             unsafe_allow_html=True)
 
+                # MEDIUM confidence after retry: same improve option as normal flow
+                if (json2 or {}).get("confidence","").upper() == "MEDIUM" and not needs_followup(json2):
+                    soft_warnings = has_soft_warnings(json2, json3)
+                    if soft_warnings:
+                        missing_html = "".join(f"<li>{w}</li>" for w in soft_warnings)
+                        st.markdown(
+                            f"<div style='background:#1a2a3a;border:1px solid #2a6a8a;border-radius:8px;"
+                            f"padding:1rem 1.25rem;margin-top:0.5rem;'>"
+                            f"<span style='color:#4ab0f0;font-weight:600;font-size:0.85rem;'>"
+                            f"ℹ️ Code found — for a more precise result, consider adding:</span>"
+                            f"<ul style='color:#aaa;font-size:0.83rem;margin:0.5rem 0 0 1.2rem;'>"
+                            f"{missing_html}</ul></div>",
+                            unsafe_allow_html=True
+                        )
+                    col_imp, col_skip = st.columns([1, 3])
+                    with col_imp:
+                        improve_retry_btn = st.button(
+                            "🔧  Improve result with more info",
+                            use_container_width=True, key="improve_retry_btn"
+                        )
+                    with col_skip:
+                        st.markdown(
+                            "<span style='color:#888;font-size:0.83rem;'>"
+                            "Result is usable as-is — accept or send to senior review.</span>",
+                            unsafe_allow_html=True
+                        )
+                    if improve_retry_btn:
+                        parts = [
+                            "Product description: " + str(ctx["description"]),
+                            "Step 1 extraction:\n" + (json.dumps(json1, indent=2) if json1 else str(raw1)),
+                            "Step 2 warnings:\n" + json.dumps((json2 or {}).get("warnings", []), indent=2),
+                            "Missing information:\n" + json.dumps((json1 or {}).get("missing_information", []), indent=2),
+                            "Current code: " + str((json2 or {}).get("cn_code","")) + " (MEDIUM confidence)",
+                            "Candidate headings: " + json.dumps((json2 or {}).get("candidate_headings", [])),
+                        ]
+                        fq_input = "\n\n".join(parts)
+                        with st.spinner("Generating targeted questions..."):
+                            raw_fq = call_claude(PROMPT_FOLLOWUP, fq_input)
+                        fq_json = extract_json(raw_fq)
+                        questions = fq_json.get("questions", []) if fq_json else []
+                        if not questions:
+                            questions = [
+                                line.lstrip("0123456789.-) ").strip()
+                                for line in raw_fq.splitlines()
+                                if line.strip() and line.strip()[0].isdigit()
+                            ][:6]
+                        if questions:
+                            st.session_state.followup_active    = True
+                            st.session_state.followup_questions = questions
+                            st.session_state.followup_context   = {
+                                "description": ctx["description"],
+                                "specs":       ctx["specs"],
+                                "img_file":    ctx.get("img_file"),
+                                "inv_file":    ctx.get("inv_file"),
+                                "candidates":  [str(c) for c in (json2 or {}).get("candidate_headings",[])],
+                            }
+                            st.rerun()
+
                 decision_tree = build_decision_tree(
                     ctx["description"], ctx["specs"], json1, json2, json3, raw2,
                     followup_qa=answers
