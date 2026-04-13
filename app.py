@@ -645,26 +645,15 @@ if st.session_state.page == "classify":
                             unsafe_allow_html=True
                         )
                     if improve_btn:
-                        fq_input = (
-                            f"Product description: {description}
-
-"
-                            f"Step 1 extraction:
-{json.dumps(json1, indent=2) if json1 else raw1}
-
-"
-                            f"Step 2 warnings:
-{json.dumps((json2 or {}).get('warnings',[]), indent=2)}
-
-"
-                            f"Missing information:
-{json.dumps((json1 or {}).get('missing_information',[]), indent=2)}
-
-"
-                            f"Current code found: {(json2 or {}).get('cn_code','')} (MEDIUM confidence)
-"
-                            f"Candidate headings: {json.dumps((json2 or {}).get('candidate_headings',[]))}"
-                        )
+                        parts = [
+                            "Product description: " + str(description),
+                            "Step 1 extraction:\n" + (json.dumps(json1, indent=2) if json1 else str(raw1)),
+                            "Step 2 warnings:\n" + json.dumps((json2 or {}).get("warnings", []), indent=2),
+                            "Missing information:\n" + json.dumps((json1 or {}).get("missing_information", []), indent=2),
+                            "Current code: " + str((json2 or {}).get("cn_code","")) + " (MEDIUM confidence)",
+                            "Candidate headings: " + json.dumps((json2 or {}).get("candidate_headings", [])),
+                        ]
+                        fq_input = "\n\n".join(parts)
                         raw_fq = call_claude(PROMPT_FOLLOWUP, fq_input)
                         fq_json = extract_json(raw_fq)
                         questions = fq_json.get("questions", []) if fq_json else []
