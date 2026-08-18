@@ -65,6 +65,11 @@ def to_num(value):
             s = s.replace(",", "")
         else:
             s = s.replace(",", ".")
+    elif s.count(".") >= 2 and re.fullmatch(r"-?\d{1,3}(\.\d{3})+", s):
+        # 1.234.567 — unambiguous dot grouping. A single group ("164.640") stays
+        # a decimal: it is genuinely ambiguous, and PROMPT_DOC_LINES already asks
+        # the model to normalise document figures to a dot decimal mark.
+        s = s.replace(".", "")
     try:
         return float(s)
     except ValueError:
@@ -400,6 +405,10 @@ def customs_value(total_amount, currency, rate, incoterm,
     steps, warnings = [], []
     cur = (currency or "EUR").upper()
 
+    if not (currency or "").strip():
+        warnings.append("Geen valuta opgegeven; het bedrag is als EUR behandeld. "
+                        "Vul de valuta in als de factuur in een andere munt staat.")
+
     if cur == "EUR":
         base = float(total_amount or 0)
         steps.append(("Factuurbedrag", f"EUR {base:,.2f}"))
@@ -460,3 +469,54 @@ def run_all_checks(items, totals, invoice_lines=None):
     findings += check_codes(items)
     findings += check_against_invoice(items, invoice_lines or [])
     return findings, basis, scores
+
+
+# ── source adapters ───────────────────────────────────────────────────────────
+
+def items_from_doc_lines(line_items):
+    """Convert LLM-read document lines into the same item shape as a prep file."""
+    out = []
+    for it in line_items or []:
+        desc = str(it.get("description") or "").strip()
+        if not desc:
+            continue
+        out.append({
+            "product":  desc,
+            "hs_code":  normalize_code(it.get("hs_code")),
+            "packages": to_num(it.get("packages")),
+            "gross":    to_num(it.get("gross")),
+            "net":      to_num(it.get("net")),
+            "price":    to_num(it.get("price")),
+            "amount":   to_num(it.get("amount")),
+        })
+    return out
+
+
+def items_to_doc_lines(items):
+    """Inverse of items_from_doc_lines, so any source can act as the cross-check."""
+    return [{
+        "description": it.get("product", ""),
+        "hs_code":     it.get("hs_code", ""),
+        "packages":    it.get("packages"),
+        "gross":       it.get("gross"),
+        "net":         it.get("net"),
+        "price":       it.get("price"),
+        "amount":      it.get("amount"),
+    } for it in items or []]
+
+
+def totals_from_stated(stated):
+    grand = {k: to_num((stated or {}).get(k))
+             for k in ("packages", "gross", "net", "amount")}
+    return {"grand": grand} if any(v is not None for v in grand.values()) else {}
+
+
+def code_coverage(items):
+    """Fraction of lines that carry a goods code — decides which source is authoritative."""
+    if not items:
+        return 0.0
+    return sum(1 for it in items if it.get("hs_code")) / len(items)
+
+
+def is_spreadsheet(filename):
+    return (filename or "").lower().endswith((".xlsx", ".xlsm", ".xltx", ".csv", ".tsv", ".txt"))
