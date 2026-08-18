@@ -1,9 +1,11 @@
 import streamlit as st
 import json
 import base64
+import io
 import uuid
 from datetime import datetime
-from anthropic import Anthropic
+from PIL import Image
+from anthropic import Anthropic, APIStatusError
 from utils.sheets import (log_to_sheets, get_pending_reviews, get_all_history,
                            save_senior_review, lookup_verified)
 from utils.prompts import PROMPT1, PROMPT2, PROMPT3, PROMPT_FOLLOWUP
@@ -96,8 +98,52 @@ with st.sidebar:
         st.markdown("<span style='color:#555;font-size:0.8rem'>No searches yet</span>", unsafe_allow_html=True)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def file_to_b64(f):
-    return base64.b64encode(f.read()).decode("utf-8")
+ALLOWED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+
+def build_file_block(f):
+    """Return a valid Anthropic content block for an uploaded file.
+
+    - PDF  -> document block (NOT an image block: the API rejects
+              application/pdf inside an image source).
+    - jfif / bmp / heic / unknown mime -> converted to JPEG.
+    - oversized images -> downscaled below the ~5 MB / 8000 px API limits.
+    """
+    f.seek(0)
+    raw  = f.read()
+    mime = (f.type or "").lower()
+    name = (f.name or "").lower()
+
+    # PDF -> document block
+    if mime == "application/pdf" or name.endswith(".pdf"):
+        return {"type": "document",
+                "source": {"type": "base64",
+                           "media_type": "application/pdf",
+                           "data": base64.b64encode(raw).decode()}}
+
+    # Unsupported / unknown image mime -> convert to JPEG
+    if mime not in ALLOWED_IMAGE_MIMES:
+        img = Image.open(io.BytesIO(raw))
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        raw, mime = buf.getvalue(), "image/jpeg"
+
+    # Too large -> downscale
+    if len(raw) > 4_500_000:
+        img = Image.open(io.BytesIO(raw))
+        img.thumbnail((1568, 1568))
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        raw, mime = buf.getvalue(), "image/jpeg"
+
+    return {"type": "image",
+            "source": {"type": "base64", "media_type": mime,
+                       "data": base64.b64encode(raw).decode()}}
+
 
 def extract_json(text: str):
     idx = text.rfind("{")
@@ -112,12 +158,23 @@ def call_claude(system: str, user_content) -> str:
     client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
     if isinstance(user_content, str):
         user_content = [{"type": "text", "text": user_content}]
-    resp = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=2000,
-        system=system,
-        messages=[{"role": "user", "content": user_content}]
-    )
+    if not user_content:
+        raise ValueError("Geen input voor de API (geen tekst en geen bestanden).")
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2000,
+            system=system,
+            messages=[{"role": "user", "content": user_content}]
+        )
+    except APIStatusError as e:
+        # Streamlit redacts the exception text, so surface the real cause here.
+        st.error(f"Anthropic API {e.status_code}: {getattr(e, 'message', '')}")
+        try:
+            st.code(str(e.response.text)[:2000], language="json")
+        except Exception:
+            pass
+        raise
     return "".join(b.text for b in resp.content if hasattr(b, "text"))
 
 def needs_followup(json2: dict) -> bool:
@@ -252,10 +309,11 @@ def run_pipeline(description, specs, img_file, inv_file, extra_context=""):
     user_content = []
     for f in [img_file, inv_file]:
         if f:
-            f.seek(0)
-            b64  = file_to_b64(f)
-            mime = f.type if f.type else "image/jpeg"
-            user_content.append({"type":"image","source":{"type":"base64","media_type":mime,"data":b64}})
+            try:
+                user_content.append(build_file_block(f))
+            except Exception as e:
+                st.warning(f"Bestand '{getattr(f,'name','?')}' kon niet worden verwerkt: "
+                           f"{type(e).__name__}: {e}")
     txt = ""
     if description:
         txt += f"Product description / invoice text:\n{description}\n\n"
@@ -265,6 +323,10 @@ def run_pipeline(description, specs, img_file, inv_file, extra_context=""):
         txt += f"Additional information provided by the user:\n{extra_context}"
     if txt:
         user_content.append({"type":"text","text":txt.strip()})
+
+    if not user_content:
+        st.error("Geen bruikbare input: geen tekst en geen leesbaar bestand.")
+        st.stop()
 
     raw1  = call_claude(PROMPT1, user_content)
     json1 = extract_json(raw1)
