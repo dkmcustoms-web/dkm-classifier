@@ -8,7 +8,8 @@ from PIL import Image
 from anthropic import Anthropic, APIStatusError
 from utils.sheets import (log_to_sheets, get_pending_reviews, get_all_history,
                            save_senior_review, lookup_verified)
-from utils.prompts import PROMPT1, PROMPT2, PROMPT3, PROMPT_FOLLOWUP
+from utils.prompts import (PROMPT1, PROMPT2, PROMPT3, PROMPT_FOLLOWUP,
+                           PROMPT_SPLIT)
 
 st.set_page_config(page_title="DKM Classifier", page_icon="🔍", layout="wide")
 
@@ -58,6 +59,12 @@ for key, default in [
     ("followup_active", False),
     ("followup_questions", []),
     ("followup_context", {}),
+    ("multi_stage", "input"),
+    ("multi_items", []),
+    ("multi_results", []),
+    ("multi_shared", ""),
+    ("multi_batch", ""),
+    ("multi_doc_meta", {}),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -76,6 +83,9 @@ with st.sidebar:
     st.markdown("### Navigation")
     if st.button("🔍  Classify product",   use_container_width=True):
         st.session_state.page = "classify"
+        st.session_state.followup_active = False
+    if st.button("📦  Classify multi",      use_container_width=True):
+        st.session_state.page = "multi"
         st.session_state.followup_active = False
     if st.button("📋  Senior review",       use_container_width=True):
         st.session_state.page = "review"
@@ -152,6 +162,53 @@ def build_file_block(f):
 
 
 def extract_json(text: str):
+    """Return the LAST complete top-level JSON object in `text`.
+
+    Scans with brace matching (string-aware) instead of rfind('{'), because
+    rfind lands on the innermost brace and therefore fails on any JSON that
+    contains nested objects — e.g. the line_items list of PROMPT_SPLIT.
+    """
+    if not text:
+        return None
+
+    found = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth, in_str, esc, end = 0, False, False, -1
+        for j in range(i, n):
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end == -1:
+            break
+        try:
+            found.append(json.loads(text[i:end + 1]))
+        except Exception:
+            pass
+        i = end + 1
+
+    if found:
+        return found[-1]
+
+    # Fallback: original behaviour, for objects without nesting
     idx = text.rfind("{")
     if idx == -1:
         return None
@@ -355,15 +412,21 @@ def run_pipeline(description, specs, img_file, inv_file, extra_context=""):
     return raw1, json1, raw2, json2, raw3, json3
 
 def save_result(description, specs, img_file, inv_file, json1, json2, json3,
-                raw1, raw2, raw3, decision_tree, followup_qa=None):
-    """Log result to Google Sheets."""
+                raw1, raw2, raw3, decision_tree, followup_qa=None,
+                row_id_override=None, desc_prefix="", quiet=False):
+    """Log result to Google Sheets.
+
+    row_id_override / desc_prefix are used by the multi-product page so that all
+    items of one document share a traceable batch reference, without requiring a
+    new column in the existing History sheet.
+    """
     outcome = json3.get("validation_outcome","UNKNOWN") if json3 else "UNKNOWN"
     code    = (json3 or {}).get("validated_code","") or (json2 or {}).get("cn_code","")
     taric   = (json3 or {}).get("taric_code","")     or (json2 or {}).get("taric_code","")
     manual  = bool((json3 or {}).get("manual_review_recommended") or
                    (json2 or {}).get("manual_review_recommended"))
     issues  = (json3 or {}).get("issues",[])
-    row_id  = str(uuid.uuid4())[:8]
+    row_id  = row_id_override or str(uuid.uuid4())[:8]
 
     followup_str = ""
     if followup_qa:
@@ -372,7 +435,7 @@ def save_result(description, specs, img_file, inv_file, json1, json2, json3,
     row = {
         "timestamp":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "user":           st.session_state.username,
-        "description":    description[:200] if description else "",
+        "description":    (desc_prefix + (description or ""))[:200],
         "specs":          specs[:200] if specs else "",
         "has_image":      "yes" if img_file else "no",
         "has_invoice":    "yes" if inv_file else "no",
@@ -397,7 +460,8 @@ def save_result(description, specs, img_file, inv_file, json1, json2, json3,
     try:
         sid, sac = get_secrets()
         log_to_sheets(row, sid, sac)
-        st.success("✓ Saved to Google Sheets")
+        if not quiet:
+            st.success("✓ Saved to Google Sheets")
     except Exception as e:
         import traceback
         st.warning(f"Sheets logging failed: {type(e).__name__}: {e}")
@@ -811,6 +875,292 @@ if st.session_state.page == "classify":
 
                 save_result(description, specs, img_file, inv_file,
                             json1, json2, json3, raw1, raw2, raw3, decision_tree)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: CLASSIFY MULTI  (documents with several goods)
+# ═══════════════════════════════════════════════════════════════════════════════
+elif st.session_state.page == "multi":
+    st.markdown("## Multi-product classification")
+    st.markdown("<span style='color:#888;font-size:0.85rem;'>Split an invoice or packing list into its line items and classify each one separately</span>",
+                unsafe_allow_html=True)
+    st.divider()
+
+    if not st.session_state.username.strip():
+        st.warning("Please enter your name or initials in the sidebar first.")
+        st.stop()
+
+    def _reset_multi():
+        st.session_state.multi_stage    = "input"
+        st.session_state.multi_items    = []
+        st.session_state.multi_results  = []
+        st.session_state.multi_shared   = ""
+        st.session_state.multi_batch    = ""
+        st.session_state.multi_doc_meta = {}
+
+    # ── STAGE 1: upload and split ─────────────────────────────────────────────
+    if st.session_state.multi_stage == "input":
+        col1, col2 = st.columns(2)
+        with col1:
+            doc_file = st.file_uploader(
+                "Invoice / packing list (PDF or image)",
+                type=["pdf","jpg","jpeg","jfif","png","webp"], key="multi_doc")
+            shared_extra = st.text_input(
+                "Shared context (optional)",
+                placeholder="e.g. all items are spare parts for ventilation systems")
+        with col2:
+            pasted = st.text_area(
+                "Or paste the invoice lines here", height=180,
+                placeholder="1  Klembeugel RVS 100mm      50 pcs\n2  Flexibele slang PVC 3m     20 pcs\n3  Ventilatorblad aluminium    5 pcs")
+
+        if st.button("📄  Analyse document", use_container_width=True):
+            content = []
+            if doc_file:
+                try:
+                    content.append(build_file_block(doc_file))
+                except Exception as e:
+                    st.error(f"Bestand kon niet worden verwerkt: {type(e).__name__}: {e}")
+                    st.stop()
+            if pasted and pasted.strip():
+                content.append({"type":"text","text":"Document text:\n" + pasted.strip()})
+            if not content:
+                st.warning("Upload a document or paste the invoice lines first.")
+                st.stop()
+
+            with st.spinner("Reading the document and splitting it into line items..."):
+                raw_split = call_claude(PROMPT_SPLIT, content)
+            split = extract_json(raw_split)
+
+            if not split:
+                st.error("Could not read the document structure.")
+                with st.expander("Raw output"):
+                    st.text(raw_split[:3000])
+                st.stop()
+
+            items = split.get("line_items") or []
+            if not items:
+                st.warning("No goods found on this document.")
+                for w in split.get("warnings", []):
+                    st.markdown(f"- {w}")
+                st.stop()
+
+            st.session_state.multi_items = [{
+                "classify":    True,
+                "line_ref":    str(it.get("line_ref","") or ""),
+                "description": str(it.get("description","") or ""),
+                "article_number": str(it.get("article_number","") or ""),
+                "quantity":    str(it.get("quantity","") or ""),
+                "specs":       str(it.get("specs","") or ""),
+                "notes":       str(it.get("notes","") or ""),
+            } for it in items]
+            shared = split.get("shared_context","") or ""
+            if shared_extra.strip():
+                shared = (shared + " " + shared_extra.strip()).strip()
+            st.session_state.multi_shared   = shared
+            st.session_state.multi_batch    = str(uuid.uuid4())[:8]
+            st.session_state.multi_doc_meta = {
+                "document_type":  split.get("document_type",""),
+                "excluded_lines": split.get("excluded_lines",[]),
+                "warnings":       split.get("warnings",[]),
+                "has_file":       bool(doc_file),
+            }
+            st.session_state.multi_stage = "confirm"
+            st.rerun()
+
+    # ── STAGE 2: confirm the split ────────────────────────────────────────────
+    elif st.session_state.multi_stage == "confirm":
+        meta  = st.session_state.multi_doc_meta
+        items = st.session_state.multi_items
+
+        st.markdown(f"### {len(items)} line item(s) found "
+                    f"<span style='color:#888;font-size:0.8rem;'>· {meta.get('document_type','document')} "
+                    f"· batch {st.session_state.multi_batch}</span>", unsafe_allow_html=True)
+
+        if meta.get("warnings"):
+            st.warning("Split warnings: " + "; ".join(meta["warnings"]))
+        if meta.get("excluded_lines"):
+            st.markdown(
+                "<span style='color:#888;font-size:0.8rem;'>Excluded as non-goods: "
+                + ", ".join(str(x) for x in meta["excluded_lines"]) + "</span>",
+                unsafe_allow_html=True)
+        if st.session_state.multi_shared:
+            st.markdown(f"<div class='followup-box'><span style='color:#4a9e4a;font-weight:600;'>"
+                        f"Shared context</span><br><span style='color:#ccc;font-size:0.88rem;'>"
+                        f"{st.session_state.multi_shared}</span></div>", unsafe_allow_html=True)
+
+        st.markdown("<span style='color:#888;font-size:0.83rem;'>"
+                    "Check the descriptions before classifying — you can edit them, add rows or "
+                    "untick items you want to skip.</span>", unsafe_allow_html=True)
+
+        edited = st.data_editor(
+            items, num_rows="dynamic", use_container_width=True, key="multi_editor",
+            column_config={
+                "classify":       st.column_config.CheckboxColumn("✓", width="small"),
+                "line_ref":       st.column_config.TextColumn("Line", width="small"),
+                "description":    st.column_config.TextColumn("Description", width="large"),
+                "article_number": st.column_config.TextColumn("Art. no.", width="small"),
+                "quantity":       st.column_config.TextColumn("Qty", width="small"),
+                "specs":          st.column_config.TextColumn("Specs", width="medium"),
+                "notes":          st.column_config.TextColumn("Note", width="medium"),
+            })
+
+        selected = [r for r in edited
+                    if r.get("classify") and str(r.get("description","")).strip()]
+
+        est = len(selected) * 3
+        col_go, col_back = st.columns([2,1])
+        with col_go:
+            go = st.button(f"🔍  Classify {len(selected)} item(s)", use_container_width=True)
+        with col_back:
+            if st.button("✕  Start over", use_container_width=True):
+                _reset_multi()
+                st.rerun()
+        st.markdown(f"<span style='color:#888;font-size:0.8rem;'>"
+                    f"≈ {est} API calls — allow roughly {max(1, est//4)}–{max(2, est//2)} "
+                    f"minutes for this batch.</span>", unsafe_allow_html=True)
+
+        if go:
+            if not selected:
+                st.warning("Select at least one item.")
+                st.stop()
+            st.session_state.multi_items   = edited
+            st.session_state.multi_results = []
+            batch = st.session_state.multi_batch
+            total = len(selected)
+            bar   = st.progress(0.0, text="Starting...")
+
+            for n, item in enumerate(selected, start=1):
+                desc = str(item.get("description","")).strip()
+                bar.progress((n-1)/total, text=f"Item {n} of {total} — {desc[:60]}")
+
+                specs_parts = [str(item.get("specs","") or "").strip(),
+                               (f"Quantity: {item['quantity']}" if item.get("quantity") else ""),
+                               (f"Article number: {item['article_number']}" if item.get("article_number") else "")]
+                specs = "\n".join(p for p in specs_parts if p)
+
+                extra = st.session_state.multi_shared
+                if item.get("notes"):
+                    extra = (extra + "\nObservation on this line: " + str(item["notes"])).strip()
+
+                try:
+                    raw1, json1, raw2, json2, raw3, json3 = run_pipeline(
+                        desc, specs, None, None, extra_context=extra)
+                except Exception as e:
+                    st.session_state.multi_results.append({
+                        "line_ref": item.get("line_ref",""), "description": desc,
+                        "error": f"{type(e).__name__}: {e}",
+                    })
+                    continue
+
+                tree = build_decision_tree(desc, specs, json1, json2, json3, raw2)
+                row_id = f"{batch}-{n:02d}"
+                save_result(desc, specs, None, None, json1, json2, json3,
+                            raw1, raw2, raw3, tree,
+                            row_id_override=row_id,
+                            desc_prefix=f"[{batch} {n}/{total}] ",
+                            quiet=True)
+
+                st.session_state.multi_results.append({
+                    "row_id":     row_id,
+                    "line_ref":   item.get("line_ref",""),
+                    "description": desc,
+                    "quantity":   item.get("quantity",""),
+                    "cn_code":    (json2 or {}).get("cn_code",""),
+                    "taric_code": (json3 or {}).get("taric_code","") or (json2 or {}).get("taric_code",""),
+                    "cn_description": (json2 or {}).get("cn_description",""),
+                    "confidence": (json2 or {}).get("confidence",""),
+                    "outcome":    (json3 or {}).get("validation_outcome","UNKNOWN"),
+                    "manual":     bool((json3 or {}).get("manual_review_recommended") or
+                                       (json2 or {}).get("manual_review_recommended")),
+                    "issues":     (json3 or {}).get("issues",[]),
+                    "warnings":   (json2 or {}).get("warnings",[]),
+                    "missing":    (json1 or {}).get("missing_information",[]),
+                    "tree":       tree,
+                    "raw2":       raw2,
+                    "raw3":       raw3,
+                })
+                bar.progress(n/total, text=f"Item {n} of {total} done")
+
+            bar.empty()
+            st.session_state.multi_stage = "results"
+            st.rerun()
+
+    # ── STAGE 3: results ──────────────────────────────────────────────────────
+    elif st.session_state.multi_stage == "results":
+        results = st.session_state.multi_results
+        batch   = st.session_state.multi_batch
+        ok      = [r for r in results if not r.get("error")]
+
+        st.markdown(f"### Batch {batch} — {len(results)} item(s)")
+
+        n_val  = len([r for r in ok if "VALIDATED" in r["outcome"] and "NOT" not in r["outcome"]])
+        n_part = len([r for r in ok if "PARTIAL" in r["outcome"]])
+        n_bad  = len([r for r in ok if "NOT VALIDATED" in r["outcome"]])
+        n_att  = len([r for r in ok if r["manual"] or not r["cn_code"]]) + \
+                 len([r for r in results if r.get("error")])
+
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("Validated", n_val)
+        c2.metric("Partial",   n_part)
+        c3.metric("Not validated", n_bad)
+        c4.metric("Needs attention", n_att)
+        st.divider()
+
+        table = [{
+            "Line":  r.get("line_ref","") or "—",
+            "Description": r["description"][:60],
+            "Qty":   r.get("quantity","") or "—",
+            "CN":    r.get("cn_code","") or "—",
+            "TARIC": r.get("taric_code","") or "—",
+            "Conf.": r.get("confidence","") or "—",
+            "Outcome": r.get("error") and "ERROR" or r.get("outcome","—"),
+            "Review": "yes" if r.get("manual") else "no",
+        } for r in results]
+        st.dataframe(table, use_container_width=True)
+
+        csv_lines = ["line_ref;description;quantity;cn_code;taric_code;confidence;outcome;manual_review;row_id"]
+        for r in results:
+            csv_lines.append(";".join([
+                str(r.get("line_ref","")), '"' + r["description"].replace('"',"'") + '"',
+                str(r.get("quantity","")), str(r.get("cn_code","")), str(r.get("taric_code","")),
+                str(r.get("confidence","")), str(r.get("error") and "ERROR" or r.get("outcome","")),
+                "yes" if r.get("manual") else "no", str(r.get("row_id","")),
+            ]))
+        st.download_button("⬇  Download batch as CSV", "\n".join(csv_lines),
+                           file_name=f"dkm_batch_{batch}.csv", mime="text/csv")
+
+        st.divider()
+        st.markdown("### Per item")
+        for r in results:
+            if r.get("error"):
+                st.error(f"Line {r.get('line_ref','?')} — {r['description'][:60]}: {r['error']}")
+                continue
+            st.markdown(verdict_html(r["outcome"], r["cn_code"], r["taric_code"],
+                                     r["manual"], r["issues"],
+                                     cn_desc=r.get("cn_description","")),
+                        unsafe_allow_html=True)
+            st.markdown(f"<span style='color:#888;font-size:0.82rem;'>"
+                        f"Line {r.get('line_ref','—')} · {r['description'][:90]} · "
+                        f"confidence {r.get('confidence','—')} · id {r['row_id']}</span>",
+                        unsafe_allow_html=True)
+            if not r["cn_code"]:
+                miss = (r.get("missing") or [])[:4]
+                st.warning("No code could be determined. Missing: "
+                           + ("; ".join(miss) if miss else "insufficient description")
+                           + " — classify this item on the single-product page to get targeted questions.")
+            elif r.get("warnings"):
+                st.markdown("<span style='color:#4ab0f0;font-size:0.82rem;'>ℹ️ "
+                            + "; ".join(r["warnings"][:3]) + "</span>", unsafe_allow_html=True)
+            with st.expander(f"📋  Decision tree — {r['row_id']}"):
+                st.markdown(f"<div class='tree-box'>{r['tree']}</div>", unsafe_allow_html=True)
+            with st.expander(f"Full reasoning — {r['row_id']}"):
+                st.markdown(r["raw2"])
+                st.divider()
+                st.markdown(r["raw3"])
+            st.divider()
+
+        if st.button("📄  New batch", use_container_width=True):
+            _reset_multi()
+            st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PAGE: SENIOR REVIEW
