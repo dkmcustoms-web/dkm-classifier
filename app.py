@@ -12,6 +12,12 @@ from utils.prompts import PROMPT1, PROMPT2, PROMPT3, PROMPT_FOLLOWUP
 
 st.set_page_config(page_title="DKM Classifier", page_icon="🔍", layout="wide")
 
+# ── Config ────────────────────────────────────────────────────────────────────
+# Model-ID's: claude-opus-5 (sterkst in redeneren), claude-sonnet-5 (balans),
+# claude-haiku-4-5-20251001 (snel/goedkoop). Sonnet 4 is uitgefaseerd -> 404.
+MODEL      = "claude-sonnet-5"
+MAX_TOKENS = 4000
+
 st.markdown("""
 <style>
     [data-testid="stAppViewContainer"] { background-color: #1a1a1a; }
@@ -162,8 +168,8 @@ def call_claude(system: str, user_content) -> str:
         raise ValueError("Geen input voor de API (geen tekst en geen bestanden).")
     try:
         resp = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2000,
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
             system=system,
             messages=[{"role": "user", "content": user_content}]
         )
