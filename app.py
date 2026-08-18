@@ -9,7 +9,8 @@ from anthropic import Anthropic, APIStatusError
 from utils.sheets import (log_to_sheets, get_pending_reviews, get_all_history,
                            save_senior_review, lookup_verified)
 from utils.prompts import (PROMPT1, PROMPT2, PROMPT3, PROMPT_FOLLOWUP,
-                           PROMPT_SPLIT)
+                           PROMPT_SPLIT, PROMPT_DOC_LINES, PROMPT_CODE_COMPARE)
+from utils import audit
 
 st.set_page_config(page_title="DKM Classifier", page_icon="🔍", layout="wide")
 
@@ -65,6 +66,15 @@ for key, default in [
     ("multi_shared", ""),
     ("multi_batch", ""),
     ("multi_doc_meta", {}),
+    ("audit_stage", "input"),
+    ("audit_items", []),
+    ("audit_totals", {}),
+    ("audit_meta", {}),
+    ("audit_invoice", {}),
+    ("audit_findings", []),
+    ("audit_opinions", []),
+    ("audit_batch", ""),
+    ("audit_value", {}),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -86,6 +96,9 @@ with st.sidebar:
         st.session_state.followup_active = False
     if st.button("📦  Classify multi",      use_container_width=True):
         st.session_state.page = "multi"
+        st.session_state.followup_active = False
+    if st.button("🧾  Dossier audit",       use_container_width=True):
+        st.session_state.page = "audit"
         st.session_state.followup_active = False
     if st.button("📋  Senior review",       use_container_width=True):
         st.session_state.page = "review"
@@ -1161,6 +1174,357 @@ elif st.session_state.page == "multi":
         if st.button("📄  New batch", use_container_width=True):
             _reset_multi()
             st.rerun()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE: DOSSIER AUDIT  (verify a customer's preparation file)
+# ═══════════════════════════════════════════════════════════════════════════════
+elif st.session_state.page == "audit":
+    st.markdown("## Dossier audit")
+    st.markdown("<span style='color:#888;font-size:0.85rem;'>Check a preparation file against the commercial invoice: "
+                "arithmetic, declared goods codes, and DKM's own classification opinion</span>",
+                unsafe_allow_html=True)
+    st.divider()
+
+    if not st.session_state.username.strip():
+        st.warning("Please enter your name or initials in the sidebar first.")
+        st.stop()
+
+    def _reset_audit():
+        for k, v in [("audit_stage","input"), ("audit_items",[]), ("audit_totals",{}),
+                     ("audit_meta",{}), ("audit_invoice",{}), ("audit_findings",[]),
+                     ("audit_opinions",[]), ("audit_batch",""), ("audit_value",{})]:
+            st.session_state[k] = v
+
+    # ── STAGE 1: upload ───────────────────────────────────────────────────────
+    if st.session_state.audit_stage == "input":
+        col1, col2 = st.columns(2)
+        with col1:
+            prep_file = st.file_uploader(
+                "Preparation file (xlsx / csv) — required",
+                type=["xlsx","xlsm","csv","tsv"], key="audit_prep")
+            inv_pdf = st.file_uploader(
+                "Commercial invoice (PDF or image) — optional but recommended",
+                type=["pdf","jpg","jpeg","jfif","png","webp"], key="audit_inv")
+        with col2:
+            ctx_txt = st.text_area(
+                "Shipment context (optional)", height=120,
+                placeholder="e.g. origin Côte d'Ivoire, 40RF reefer, sea freight Abidjan–Antwerp, foodstuffs")
+            st.markdown("<span style='color:#888;font-size:0.8rem;'>Context is passed to the "
+                        "classification engine — origin and transport can matter for the code.</span>",
+                        unsafe_allow_html=True)
+
+        st.markdown("#### Value calculation")
+        v1, v2, v3, v4 = st.columns(4)
+        currency  = v1.text_input("Currency", value="", placeholder="XOF / EUR / USD")
+        rate      = v2.text_input("Rate (1 EUR = ...)", value="",
+                                  placeholder="blank = fixed parity")
+        incoterm  = v3.text_input("Incoterm", value="", placeholder="FOB / CIF / EXW")
+        freight   = v4.text_input("Freight (EUR)", value="", placeholder="2450")
+        i1, i2, _ = st.columns([1,1,2])
+        insurance = i1.text_input("Insurance (EUR)", value="")
+        other_add = i2.text_input("Other additions (EUR)", value="")
+
+        if st.button("📥  Read dossier", use_container_width=True):
+            if not prep_file:
+                st.warning("Upload the preparation file first.")
+                st.stop()
+            try:
+                prep_file.seek(0)
+                items, totals, colmap, notes = audit.parse_prep_file(
+                    prep_file.read(), prep_file.name)
+            except Exception as e:
+                st.error(f"Kon het voorbereidingsbestand niet lezen: {type(e).__name__}: {e}")
+                st.stop()
+            if not items:
+                st.error("Geen regels herkend in het voorbereidingsbestand.")
+                for n in notes:
+                    st.markdown(f"- {n}")
+                st.stop()
+
+            invoice = {}
+            if inv_pdf:
+                try:
+                    block = build_file_block(inv_pdf)
+                except Exception as e:
+                    st.error(f"Factuur kon niet worden verwerkt: {type(e).__name__}: {e}")
+                    st.stop()
+                with st.spinner("Reading the commercial invoice..."):
+                    raw_inv = call_claude(PROMPT_DOC_LINES, [block])
+                invoice = extract_json(raw_inv) or {}
+                if not invoice:
+                    st.warning("Kon de factuur niet gestructureerd lezen; "
+                               "de vergelijking met de factuur wordt overgeslagen.")
+
+            st.session_state.audit_items   = items
+            st.session_state.audit_totals  = totals
+            st.session_state.audit_invoice = invoice
+            st.session_state.audit_batch   = str(uuid.uuid4())[:8]
+            st.session_state.audit_meta    = {
+                "notes": notes, "colmap": colmap, "context": ctx_txt,
+                "currency": (currency or invoice.get("currency","") or "").strip(),
+                "rate": rate.strip(), "incoterm": (incoterm or invoice.get("incoterm","") or "").strip(),
+                "freight": freight.strip(), "insurance": insurance.strip(),
+                "other": other_add.strip(), "prep_name": prep_file.name,
+            }
+            st.session_state.audit_stage = "review"
+            st.rerun()
+
+    # ── STAGE 2: deterministic checks (no API cost) ───────────────────────────
+    elif st.session_state.audit_stage in ("review", "opinion"):
+        items   = st.session_state.audit_items
+        totals  = st.session_state.audit_totals
+        invoice = st.session_state.audit_invoice or {}
+        meta    = st.session_state.audit_meta
+        batch   = st.session_state.audit_batch
+
+        findings, basis, scores = audit.run_all_checks(
+            items, totals, invoice.get("line_items") or [])
+        st.session_state.audit_findings = findings
+        summary = audit.summarize(findings)
+
+        st.markdown(f"### Dossier {batch} "
+                    f"<span style='color:#888;font-size:0.8rem;'>· {meta.get('prep_name','')} "
+                    f"· {len(items)} regels</span>", unsafe_allow_html=True)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Lines", len(items))
+        c2.metric("Errors", summary["errors"])
+        c3.metric("Warnings", summary["warnings"])
+        c4.metric("Notes", summary["infos"])
+
+        if invoice:
+            bits = [invoice.get("document_number",""), invoice.get("document_date",""),
+                    invoice.get("currency",""), invoice.get("incoterm",""),
+                    invoice.get("country_of_origin","")]
+            st.markdown("<span style='color:#888;font-size:0.82rem;'>Invoice: "
+                        + " · ".join(b for b in bits if b) + "</span>", unsafe_allow_html=True)
+            if invoice.get("origin_statement"):
+                st.markdown(f"<span style='color:#888;font-size:0.8rem;'>Origin statement: "
+                            f"{invoice['origin_statement'][:200]}</span>", unsafe_allow_html=True)
+
+        st.divider()
+
+        # ── value calculation ─────────────────────────────────────────────────
+        stated_total = ((totals.get("grand") or {}).get("amount")
+                        or sum(i.get("amount") or 0 for i in items))
+        cv, steps, vwarn = audit.customs_value(
+            stated_total, meta.get("currency"), audit.to_num(meta.get("rate")),
+            meta.get("incoterm"), audit.to_num(meta.get("freight")) or 0,
+            audit.to_num(meta.get("insurance")) or 0, audit.to_num(meta.get("other")) or 0)
+        st.session_state.audit_value = {"value": cv, "steps": steps, "warnings": vwarn}
+
+        st.markdown("### Customs value")
+        if cv is None:
+            st.warning("; ".join(vwarn) or "Niet berekend.")
+        else:
+            rows = "".join(
+                f"<tr><td style='padding:2px 14px 2px 0;color:#aaa;'>{k}</td>"
+                f"<td style='font-family:monospace;color:#eee;'>{v}</td></tr>" for k, v in steps)
+            st.markdown(f"<div class='tree-box'><table>{rows}</table></div>",
+                        unsafe_allow_html=True)
+            for w in vwarn:
+                st.warning(w)
+
+        st.divider()
+
+        # ── findings ──────────────────────────────────────────────────────────
+        st.markdown("### Checks")
+        st.markdown(f"<span style='color:#888;font-size:0.82rem;'>Line amounts were verified "
+                    f"against <strong>{ {'net':'net weight','gross':'gross weight','packages':'package count'}.get(basis,'—') }</strong> "
+                    f"× unit price ({scores.get(basis,0)} of {len(items)} lines match this basis). "
+                    f"All arithmetic is computed by the application, not by the AI.</span>",
+                    unsafe_allow_html=True)
+
+        if not findings:
+            st.success("✓ No arithmetic or code-format problems found.")
+        for sev, css, icon in [("error","verdict-invalid","✗"),
+                               ("warning","verdict-partial","~"),
+                               ("info","verdict-verified","ℹ")]:
+            group = [f for f in findings if f["severity"] == sev]
+            if not group:
+                continue
+            body = "".join(
+                f"<div style='margin-bottom:6px;'>{icon} "
+                f"<strong>{(f['line'] or 'dossier')}</strong> — {f['message']}"
+                + (f"<br><span style='color:#888;font-size:0.8rem;margin-left:16px;'>{f['detail']}</span>"
+                   if f.get('detail') else "") + "</div>"
+                for f in group)
+            st.markdown(f"<div class='{css}'>{body}</div>", unsafe_allow_html=True)
+
+        st.divider()
+
+        # ── declared lines ────────────────────────────────────────────────────
+        st.markdown("### Declared lines")
+        st.dataframe([{
+            "Product": i["product"][:44], "Declared code": i["hs_code"],
+            "Colis": i["packages"], "Gross": i["gross"], "Net": i["net"],
+            "Unit": i["price"], "Amount": i["amount"],
+        } for i in items], use_container_width=True)
+
+        # ── own opinion ───────────────────────────────────────────────────────
+        st.divider()
+        st.markdown("### DKM classification opinion")
+
+        if st.session_state.audit_stage == "review":
+            est = len(items) * 4
+            col_go, col_reset = st.columns([2,1])
+            with col_go:
+                run_op = st.button(f"⚖️  Classify all {len(items)} lines independently",
+                                   use_container_width=True)
+            with col_reset:
+                if st.button("✕  New dossier", use_container_width=True):
+                    _reset_audit(); st.rerun()
+            st.markdown(f"<span style='color:#888;font-size:0.8rem;'>Runs the full 3-step pipeline "
+                        f"per line and compares the result with the declared code. "
+                        f"≈ {est} API calls.</span>", unsafe_allow_html=True)
+
+            if run_op:
+                st.session_state.audit_opinions = []
+                total = len(items)
+                bar = st.progress(0.0, text="Starting...")
+                for n, it in enumerate(items, start=1):
+                    bar.progress((n-1)/total, text=f"Line {n} of {total} — {it['product'][:50]}")
+                    specs = " · ".join(x for x in [
+                        f"{it['packages']:g} packages" if it.get("packages") else "",
+                        f"gross {it['gross']:g} kg" if it.get("gross") else "",
+                        f"net {it['net']:g} kg" if it.get("net") else "",
+                        f"unit price {it['price']:g}" if it.get("price") else "",
+                    ] if x)
+                    extra = meta.get("context","")
+                    if invoice.get("country_of_origin"):
+                        extra += f"\nCountry of origin: {invoice['country_of_origin']}"
+                    try:
+                        raw1, json1, raw2, json2, raw3, json3 = run_pipeline(
+                            it["product"], specs, None, None, extra_context=extra.strip())
+                    except Exception as e:
+                        st.session_state.audit_opinions.append(
+                            {"product": it["product"], "declared": it["hs_code"],
+                             "error": f"{type(e).__name__}: {e}"})
+                        continue
+
+                    own_taric = ((json3 or {}).get("taric_code","")
+                                 or (json2 or {}).get("taric_code",""))
+                    own_cn    = (json2 or {}).get("cn_code","")
+                    level     = audit.compare_codes(it["hs_code"], own_taric or own_cn)
+
+                    compare = {}
+                    if level not in ("identical",) and own_cn:
+                        cmp_input = (
+                            f"Product data:\n{json.dumps(json1, indent=2) if json1 else it['product']}\n\n"
+                            f"Declared code in preparation file: {it['hs_code']}\n\n"
+                            f"DKM engine code: CN {own_cn} / TARIC {own_taric}\n"
+                            f"Engine confidence: {(json2 or {}).get('confidence','')}\n\n"
+                            f"Engine reasoning:\n{raw2[:4000]}")
+                        try:
+                            compare = extract_json(call_claude(PROMPT_CODE_COMPARE, cmp_input)) or {}
+                        except Exception:
+                            compare = {}
+
+                    tree = build_decision_tree(it["product"], specs, json1, json2, json3, raw2)
+                    row_id = f"AUD{batch}-{n:02d}"
+                    issues = list((json3 or {}).get("issues", []))
+                    issues.append(f"Declared {it['hs_code']} vs DKM {own_taric or own_cn} "
+                                  f"({audit.AGREEMENT_LABELS.get(level,('?',''))[0]})")
+                    save_result(it["product"], specs, None, None, json1, json2,
+                                {**(json3 or {}), "issues": issues},
+                                raw1, raw2, raw3, tree,
+                                row_id_override=row_id,
+                                desc_prefix=f"[AUDIT {batch} {n}/{total}] ", quiet=True)
+
+                    st.session_state.audit_opinions.append({
+                        "row_id": row_id, "product": it["product"], "declared": it["hs_code"],
+                        "own_cn": own_cn, "own_taric": own_taric,
+                        "own_desc": (json2 or {}).get("cn_description",""),
+                        "confidence": (json2 or {}).get("confidence",""),
+                        "outcome": (json3 or {}).get("validation_outcome",""),
+                        "level": level, "compare": compare, "tree": tree, "raw2": raw2,
+                    })
+                    bar.progress(n/total, text=f"Line {n} of {total} done")
+                bar.empty()
+                st.session_state.audit_stage = "opinion"
+                st.rerun()
+
+        else:
+            ops = st.session_state.audit_opinions
+            ok  = [o for o in ops if not o.get("error")]
+            agree = len([o for o in ok if o["level"] == "identical"])
+            minor = len([o for o in ok if o["level"] in ("taric","subheading")])
+            major = len([o for o in ok if o["level"] in ("heading","chapter","different")])
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Identical", agree)
+            m2.metric("Minor difference", minor)
+            m3.metric("Substantive difference", major)
+
+            st.dataframe([{
+                "Product": o["product"][:40],
+                "Declared": o.get("declared",""),
+                "DKM": o.get("own_taric") or o.get("own_cn",""),
+                "Agreement": audit.AGREEMENT_LABELS.get(o.get("level","unknown"))[0],
+                "Conf.": o.get("confidence",""),
+                "Prefers": (o.get("compare") or {}).get("preferred",""),
+                "Risk": (o.get("compare") or {}).get("risk",""),
+            } for o in ops], use_container_width=True)
+
+            csv_rows = ["product;declared_code;dkm_cn;dkm_taric;agreement;confidence;preferred;risk;recommended;row_id"]
+            for o in ops:
+                c = o.get("compare") or {}
+                csv_rows.append(";".join([
+                    '"' + o["product"].replace('"',"'") + '"', str(o.get("declared","")),
+                    str(o.get("own_cn","")), str(o.get("own_taric","")),
+                    audit.AGREEMENT_LABELS.get(o.get("level","unknown"))[0],
+                    str(o.get("confidence","")), str(c.get("preferred","")),
+                    str(c.get("risk","")), str(c.get("recommended_code","")),
+                    str(o.get("row_id",""))]))
+            fnd = ["", "severity;code;line;message"]
+            for f in st.session_state.audit_findings:
+                fnd.append(";".join([f["severity"], f["code"], '"' + str(f["line"] or "") + '"',
+                                     '"' + f["message"].replace('"',"'") + '"']))
+            st.download_button("⬇  Download audit as CSV",
+                               "\n".join(csv_rows + fnd),
+                               file_name=f"dkm_audit_{batch}.csv", mime="text/csv")
+
+            st.divider()
+            for o in ops:
+                if o.get("error"):
+                    st.error(f"{o['product'][:50]}: {o['error']}")
+                    continue
+                lvl   = o.get("level","unknown")
+                label, expl = audit.AGREEMENT_LABELS.get(lvl, ("?",""))
+                sev   = audit.AGREEMENT_SEVERITY.get(lvl,"warning")
+                css   = {"ok":"verdict-validated","warning":"verdict-partial",
+                         "error":"verdict-invalid"}[sev]
+                icon  = {"ok":"✓","warning":"~","error":"✗"}[sev]
+                c = o.get("compare") or {}
+                body = (f"<div style='font-size:0.8rem;font-weight:600;letter-spacing:0.06em;"
+                        f"text-transform:uppercase;margin-bottom:0.5rem;'>{icon} {label}</div>"
+                        f"<div style='color:#ddd;font-size:0.95rem;margin-bottom:6px;'>"
+                        f"{o['product'][:70]}</div>"
+                        f"<div style='display:flex;gap:26px;flex-wrap:wrap;'>"
+                        f"<div><span style='color:#888;font-size:0.72rem;'>DECLARED</span><br>"
+                        f"<span class='cn-code' style='font-size:1.25rem;'>{o.get('declared','—')}</span></div>"
+                        f"<div><span style='color:#888;font-size:0.72rem;'>DKM ENGINE</span><br>"
+                        f"<span class='cn-code' style='font-size:1.25rem;'>{o.get('own_taric') or o.get('own_cn','—')}</span></div>"
+                        f"</div>")
+                if o.get("own_desc"):
+                    body += (f"<div style='color:#aaa;font-size:0.83rem;margin-top:6px;'>"
+                             f"{o['own_desc']}</div>")
+                if c.get("reasoning"):
+                    body += (f"<div style='color:#ccc;font-size:0.86rem;margin-top:8px;'>"
+                             f"<strong>Opinion ({c.get('preferred','')}"
+                             + (f", risk {c['risk']}" if c.get("risk") else "") + ")</strong>: "
+                             f"{c['reasoning']}</div>")
+                if c.get("question_for_client"):
+                    body += (f"<div style='color:#f0a030;font-size:0.83rem;margin-top:6px;'>"
+                             f"→ Ask the client: {c['question_for_client']}</div>")
+                st.markdown(f"<div class='{css}'>{body}</div>", unsafe_allow_html=True)
+                with st.expander(f"📋  Decision tree — {o.get('row_id','')}"):
+                    st.markdown(f"<div class='tree-box'>{o['tree']}</div>", unsafe_allow_html=True)
+                with st.expander(f"Full reasoning — {o.get('row_id','')}"):
+                    st.markdown(o["raw2"])
+
+            st.divider()
+            if st.button("✕  New dossier", use_container_width=True):
+                _reset_audit(); st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PAGE: SENIOR REVIEW

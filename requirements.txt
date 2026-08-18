@@ -3,3 +3,5 @@ anthropic
 gspread
 google-auth
 Pillow
+openpyxl
+pandas
