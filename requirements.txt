@@ -5,3 +5,4 @@ google-auth
 Pillow
 openpyxl
 pandas
+psycopg[binary]

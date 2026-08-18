@@ -10,7 +10,8 @@ from utils.sheets import (log_to_sheets, get_pending_reviews, get_all_history,
                            save_senior_review, lookup_verified)
 from utils.prompts import (PROMPT1, PROMPT2, PROMPT3, PROMPT_FOLLOWUP,
                            PROMPT_SPLIT, PROMPT_DOC_LINES, PROMPT_CODE_COMPARE)
-from utils import audit
+from utils import audit, pricing
+from utils import db as neon
 
 st.set_page_config(page_title="DKM Classifier", page_icon="🔍", layout="wide")
 
@@ -75,9 +76,92 @@ for key, default in [
     ("audit_opinions", []),
     ("audit_batch", ""),
     ("audit_value", {}),
+    ("usage_events", []),
+    ("last_run_events", []),
+    ("schema_ready", False),
+    ("multi_cost", {}),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
+
+# ── storage backends ──────────────────────────────────────────────────────────
+
+def _secret(name, default=""):
+    try:
+        return st.secrets[name]
+    except Exception:
+        return default
+
+
+def neon_dsn():
+    return str(_secret("NEON_DATABASE_URL", "") or "").strip()
+
+
+def sheets_configured():
+    return bool(_secret("GOOGLE_SHEETS_ID", "")) and bool(_secret("GOOGLE_SERVICE_ACCOUNT", ""))
+
+
+def ensure_schema():
+    """Create the Neon tables once per session."""
+    dsn = neon_dsn()
+    if not dsn or st.session_state.schema_ready:
+        return bool(dsn)
+    try:
+        neon.init_schema(dsn)
+        st.session_state.schema_ready = True
+        return True
+    except Exception as e:
+        st.warning(f"Neon niet bereikbaar: {type(e).__name__}: {e}")
+        return False
+
+
+def usd_per_eur():
+    try:
+        return float(_secret("USD_PER_EUR", 0) or 0)
+    except Exception:
+        return 0.0
+
+
+def price_overrides():
+    try:
+        return dict(st.secrets["MODEL_PRICING"])
+    except Exception:
+        return {}
+
+
+# ── usage / cost tracking ─────────────────────────────────────────────────────
+
+def record_usage(model, usage, step="", row_id="", batch_id=""):
+    tokens = pricing.usage_to_dict(usage)
+    cost, known = pricing.cost_usd(model, tokens, price_overrides())
+    event = {
+        "user": st.session_state.username, "page": st.session_state.page,
+        "step": step, "model": model, "row_id": row_id, "batch_id": batch_id,
+        "cost_usd": cost, "rate_known": known, **tokens,
+    }
+    st.session_state.usage_events.append(event)
+    st.session_state.last_run_events.append(event)
+    return event
+
+
+def take_run_events():
+    """Return and clear the events collected since the last checkpoint."""
+    events = list(st.session_state.last_run_events)
+    st.session_state.last_run_events = []
+    return events
+
+
+def cost_caption(events, label="This run"):
+    s = pricing.summarize_events(events)
+    eur = pricing.fmt_eur(s["cost_usd"], usd_per_eur())
+    parts = [f"{label}: <strong>{pricing.fmt_usd(s['cost_usd'])}</strong>"]
+    if eur:
+        parts.append(f"({eur})")
+    parts.append(f"· {s['calls']} calls · {s['input_tokens']:,} in / {s['output_tokens']:,} out tokens")
+    if any(not e.get("rate_known", True) for e in events or []):
+        parts.append("· ⚠ unknown rate for at least one model, estimate only")
+    return ("<span style='color:#888;font-size:0.8rem;'>" + " ".join(parts) + "</span>")
+
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -108,6 +192,41 @@ with st.sidebar:
     st.markdown("### User")
     username = st.text_input("Name / initials", value=st.session_state.username, placeholder="e.g. LVD")
     st.session_state.username = username
+    st.divider()
+    st.markdown("### AI cost")
+    _sess = pricing.summarize_events(st.session_state.usage_events)
+    _eur  = pricing.fmt_eur(_sess["cost_usd"], usd_per_eur())
+    st.markdown(
+        f"<div style='font-size:1.35rem;font-weight:700;color:#D94F2B;font-family:monospace;'>"
+        f"{pricing.fmt_usd(_sess['cost_usd'])}</div>"
+        + (f"<div style='color:#888;font-size:0.78rem;'>{_eur}</div>" if _eur else "")
+        + f"<div style='color:#888;font-size:0.75rem;margin-top:2px;'>this session · "
+          f"{_sess['calls']} calls · {_sess['input_tokens']+_sess['output_tokens']:,} tokens</div>",
+        unsafe_allow_html=True)
+    if _sess["by_step"]:
+        rows = "".join(
+            f"<div style='display:flex;justify-content:space-between;font-size:0.74rem;"
+            f"color:#999;padding:1px 0;'><span>{k}</span>"
+            f"<span style='font-family:monospace;'>{pricing.fmt_usd(v['cost_usd'])}</span></div>"
+            for k, v in sorted(_sess["by_step"].items(), key=lambda kv: -kv[1]["cost_usd"]))
+        with st.expander("Breakdown"):
+            st.markdown(rows, unsafe_allow_html=True)
+    st.markdown(f"<div style='color:#666;font-size:0.7rem;margin-top:4px;'>"
+                f"{MODEL} · rates checked {pricing.PRICING_VERIFIED} · estimate</div>",
+                unsafe_allow_html=True)
+
+    st.divider()
+    st.markdown("### Storage")
+    _store = []
+    if neon_dsn():
+        _store.append("Neon")
+    if sheets_configured():
+        _store.append("Sheets")
+    st.markdown(
+        f"<span style='color:{'#4a9e4a' if _store else '#c84a4a'};font-size:0.78rem;'>"
+        f"{' + '.join(_store) if _store else 'not configured'}</span>",
+        unsafe_allow_html=True)
+
     st.divider()
     st.markdown("### Session history")
     if st.session_state.history:
@@ -230,7 +349,8 @@ def extract_json(text: str):
     except Exception:
         return None
 
-def call_claude(system: str, user_content) -> str:
+def call_claude(system: str, user_content, step: str = "", row_id: str = "",
+                batch_id: str = "") -> str:
     client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
     if isinstance(user_content, str):
         user_content = [{"type": "text", "text": user_content}]
@@ -251,6 +371,8 @@ def call_claude(system: str, user_content) -> str:
         except Exception:
             pass
         raise
+    record_usage(MODEL, getattr(resp, "usage", None), step=step,
+                 row_id=row_id, batch_id=batch_id)
     return "".join(b.text for b in resp.content if hasattr(b, "text"))
 
 def needs_followup(json2: dict) -> bool:
@@ -404,13 +526,13 @@ def run_pipeline(description, specs, img_file, inv_file, extra_context=""):
         st.error("Geen bruikbare input: geen tekst en geen leesbaar bestand.")
         st.stop()
 
-    raw1  = call_claude(PROMPT1, user_content)
+    raw1  = call_claude(PROMPT1, user_content, step="step1_extraction")
     json1 = extract_json(raw1)
 
     # STEP 2
     step2_input = "Structured product data from feature extractor:\n\n" + (
         json.dumps(json1, indent=2) if json1 else raw1)
-    raw2  = call_claude(PROMPT2, step2_input)
+    raw2  = call_claude(PROMPT2, step2_input, step="step2_classification")
     json2 = extract_json(raw2)
 
     # STEP 3
@@ -419,14 +541,15 @@ def run_pipeline(description, specs, img_file, inv_file, extra_context=""):
         f"Proposed classification:\n{json.dumps(json2, indent=2) if json2 else raw2}\n\n"
         f"Full reasoning:\n{raw2}"
     )
-    raw3  = call_claude(PROMPT3, step3_input)
+    raw3  = call_claude(PROMPT3, step3_input, step="step3_validation")
     json3 = extract_json(raw3)
 
     return raw1, json1, raw2, json2, raw3, json3
 
 def save_result(description, specs, img_file, inv_file, json1, json2, json3,
                 raw1, raw2, raw3, decision_tree, followup_qa=None,
-                row_id_override=None, desc_prefix="", quiet=False):
+                row_id_override=None, desc_prefix="", quiet=False,
+                batch_id="", source="classify", declared_code="", agreement=""):
     """Log result to Google Sheets.
 
     row_id_override / desc_prefix are used by the multi-product page so that all
@@ -470,15 +593,41 @@ def save_result(description, specs, img_file, inv_file, json1, json2, json3,
         "row_id":         row_id,
         "followup_qa":    followup_str,
     }
-    try:
-        sid, sac = get_secrets()
-        log_to_sheets(row, sid, sac)
-        if not quiet:
-            st.success("✓ Saved to Google Sheets")
-    except Exception as e:
-        import traceback
-        st.warning(f"Sheets logging failed: {type(e).__name__}: {e}")
-        st.code(traceback.format_exc(), language="text")
+    events = take_run_events()
+    for e in events:
+        e["row_id"] = e.get("row_id") or row_id
+        e["batch_id"] = e.get("batch_id") or batch_id
+    usage = pricing.summarize_events(events)
+    row["cost_usd"]      = usage["cost_usd"]
+    row["input_tokens"]  = usage["input_tokens"]
+    row["output_tokens"] = usage["output_tokens"]
+    row["batch_id"]      = batch_id
+    row["source"]        = source
+    row["declared_code"] = declared_code
+    row["agreement"]     = agreement
+
+    saved = []
+    if neon_dsn() and ensure_schema():
+        try:
+            neon.log_classification(neon_dsn(), row)
+            neon.log_usage_events(neon_dsn(), events)
+            saved.append("Neon")
+        except Exception as e:
+            st.warning(f"Neon logging failed: {type(e).__name__}: {e}")
+    if sheets_configured():
+        try:
+            sid, sac = get_secrets()
+            log_to_sheets(row, sid, sac)
+            saved.append("Sheets")
+        except Exception as e:
+            import traceback
+            st.warning(f"Sheets logging failed: {type(e).__name__}: {e}")
+            st.code(traceback.format_exc(), language="text")
+    if not saved:
+        st.warning("Niet opgeslagen: geen Neon-connectiestring en geen Sheets-configuratie.")
+    elif not quiet:
+        st.success("✓ Saved to " + " + ".join(saved))
+        st.markdown(cost_caption(events), unsafe_allow_html=True)
 
     st.session_state.history.append({
         "timestamp": datetime.now().strftime("%H:%M"),
@@ -621,7 +770,7 @@ if st.session_state.page == "classify":
                         ]
                         fq_input = "\n\n".join(parts)
                         with st.spinner("Generating targeted questions..."):
-                            raw_fq = call_claude(PROMPT_FOLLOWUP, fq_input)
+                            raw_fq = call_claude(PROMPT_FOLLOWUP, fq_input, step="followup")
                         fq_json = extract_json(raw_fq)
                         questions = fq_json.get("questions", []) if fq_json else []
                         if not questions:
@@ -721,8 +870,13 @@ if st.session_state.page == "classify":
             verified_match = None
             if description:
                 try:
-                    sid, sac = get_secrets()
-                    verified_match = lookup_verified(description, sid, sac)
+                    if neon_dsn() and ensure_schema():
+                        from utils.sheets import _make_fingerprint
+                        verified_match = neon.lookup_verified(
+                            neon_dsn(), _make_fingerprint(description))
+                    else:
+                        sid, sac = get_secrets()
+                        verified_match = lookup_verified(description, sid, sac)
                 except Exception:
                     pass
 
@@ -773,7 +927,7 @@ if st.session_state.page == "classify":
                     f"Missing information:\n{json.dumps((json1 or {}).get('missing_information',[]), indent=2)}\n\n"
                     f"Candidate headings found: {json.dumps((json2 or {}).get('candidate_headings',[]))}"
                 )
-                raw_questions = call_claude(PROMPT_FOLLOWUP, followup_input)
+                raw_questions = call_claude(PROMPT_FOLLOWUP, followup_input, step="followup")
                 fq_json = extract_json(raw_questions)
                 questions = fq_json.get("questions", []) if fq_json else []
 
@@ -857,7 +1011,7 @@ if st.session_state.page == "classify":
                             "Candidate headings: " + json.dumps((json2 or {}).get("candidate_headings", [])),
                         ]
                         fq_input = "\n\n".join(parts)
-                        raw_fq = call_claude(PROMPT_FOLLOWUP, fq_input)
+                        raw_fq = call_claude(PROMPT_FOLLOWUP, fq_input, step="followup")
                         fq_json = extract_json(raw_fq)
                         questions = fq_json.get("questions", []) if fq_json else []
                         if not questions:
@@ -940,7 +1094,7 @@ elif st.session_state.page == "multi":
                 st.stop()
 
             with st.spinner("Reading the document and splitting it into line items..."):
-                raw_split = call_claude(PROMPT_SPLIT, content)
+                raw_split = call_claude(PROMPT_SPLIT, content, step="split")
             split = extract_json(raw_split)
 
             if not split:
@@ -1070,7 +1224,7 @@ elif st.session_state.page == "multi":
                             raw1, raw2, raw3, tree,
                             row_id_override=row_id,
                             desc_prefix=f"[{batch} {n}/{total}] ",
-                            quiet=True)
+                            quiet=True, batch_id=batch, source="multi")
 
                 st.session_state.multi_results.append({
                     "row_id":     row_id,
@@ -1094,6 +1248,8 @@ elif st.session_state.page == "multi":
                 bar.progress(n/total, text=f"Item {n} of {total} done")
 
             bar.empty()
+            st.session_state.multi_cost = pricing.summarize_events(
+                [e for e in st.session_state.usage_events if e.get("batch_id") == batch])
             st.session_state.multi_stage = "results"
             st.rerun()
 
@@ -1104,6 +1260,15 @@ elif st.session_state.page == "multi":
         ok      = [r for r in results if not r.get("error")]
 
         st.markdown(f"### Batch {batch} — {len(results)} item(s)")
+        _bc = st.session_state.get("multi_cost") or {}
+        if _bc:
+            _e = pricing.fmt_eur(_bc.get("cost_usd"), usd_per_eur())
+            st.markdown(f"<span style='color:#888;font-size:0.82rem;'>AI cost for this batch: "
+                        f"<strong>{pricing.fmt_usd(_bc.get('cost_usd'))}</strong>"
+                        + (f" ({_e})" if _e else "")
+                        + f" · {_bc.get('calls',0)} calls · "
+                          f"{pricing.fmt_usd((_bc.get('cost_usd') or 0)/max(1,len(results)))} per line"
+                          f"</span>", unsafe_allow_html=True)
 
         n_val  = len([r for r in ok if "VALIDATED" in r["outcome"] and "NOT" not in r["outcome"]])
         n_part = len([r for r in ok if "PARTIAL" in r["outcome"]])
@@ -1197,27 +1362,33 @@ elif st.session_state.page == "audit":
 
     # ── STAGE 1: upload ───────────────────────────────────────────────────────
     if st.session_state.audit_stage == "input":
+        st.markdown("<span style='color:#888;font-size:0.83rem;'>Provide at least one source. "
+                    "Give two and they are checked against each other; give one and only that "
+                    "document is verified. Spreadsheets are read directly; PDFs, images and "
+                    "pasted text are read by the document reader.</span>",
+                    unsafe_allow_html=True)
         col1, col2 = st.columns(2)
         with col1:
-            prep_file = st.file_uploader(
-                "Preparation file (xlsx / csv) — required",
-                type=["xlsx","xlsm","csv","tsv"], key="audit_prep")
-            inv_pdf = st.file_uploader(
-                "Commercial invoice (PDF or image) — optional but recommended",
-                type=["pdf","jpg","jpeg","jfif","png","webp"], key="audit_inv")
+            src_a = st.file_uploader(
+                "Source A — preparation file or declaration (xlsx / csv / PDF / image)",
+                type=["xlsx","xlsm","csv","tsv","pdf","jpg","jpeg","jfif","png","webp"],
+                key="audit_a")
+            src_b = st.file_uploader(
+                "Source B — commercial invoice or second document (optional)",
+                type=["xlsx","xlsm","csv","tsv","pdf","jpg","jpeg","jfif","png","webp"],
+                key="audit_b")
         with col2:
-            ctx_txt = st.text_area(
-                "Shipment context (optional)", height=120,
-                placeholder="e.g. origin Côte d'Ivoire, 40RF reefer, sea freight Abidjan–Antwerp, foodstuffs")
-            st.markdown("<span style='color:#888;font-size:0.8rem;'>Context is passed to the "
-                        "classification engine — origin and transport can matter for the code.</span>",
-                        unsafe_allow_html=True)
+            pasted = st.text_area(
+                "Or paste the lines here", height=150,
+                placeholder="BISSAP           1212999590   14 colis   274,4 kg   600   164640\nKAOLIN           2507002000   41 colis   803,6 kg   125   100450")
+            ctx_txt = st.text_input(
+                "Shipment context (optional)",
+                placeholder="e.g. origin Côte d'Ivoire, 40RF reefer, sea freight Abidjan–Antwerp")
 
         st.markdown("#### Value calculation")
         v1, v2, v3, v4 = st.columns(4)
         currency  = v1.text_input("Currency", value="", placeholder="XOF / EUR / USD")
-        rate      = v2.text_input("Rate (1 EUR = ...)", value="",
-                                  placeholder="blank = fixed parity")
+        rate      = v2.text_input("Rate (1 EUR = ...)", value="", placeholder="blank = fixed parity")
         incoterm  = v3.text_input("Incoterm", value="", placeholder="FOB / CIF / EXW")
         freight   = v4.text_input("Freight (EUR)", value="", placeholder="2450")
         i1, i2, _ = st.columns([1,1,2])
@@ -1225,46 +1396,95 @@ elif st.session_state.page == "audit":
         other_add = i2.text_input("Other additions (EUR)", value="")
 
         if st.button("📥  Read dossier", use_container_width=True):
-            if not prep_file:
-                st.warning("Upload the preparation file first.")
-                st.stop()
-            try:
-                prep_file.seek(0)
-                items, totals, colmap, notes = audit.parse_prep_file(
-                    prep_file.read(), prep_file.name)
-            except Exception as e:
-                st.error(f"Kon het voorbereidingsbestand niet lezen: {type(e).__name__}: {e}")
-                st.stop()
-            if not items:
-                st.error("Geen regels herkend in het voorbereidingsbestand.")
-                for n in notes:
-                    st.markdown(f"- {n}")
+            if not src_a and not src_b and not (pasted and pasted.strip()):
+                st.warning("Provide a file or paste the lines first.")
                 st.stop()
 
-            invoice = {}
-            if inv_pdf:
-                try:
-                    block = build_file_block(inv_pdf)
-                except Exception as e:
-                    st.error(f"Factuur kon niet worden verwerkt: {type(e).__name__}: {e}")
-                    st.stop()
-                with st.spinner("Reading the commercial invoice..."):
-                    raw_inv = call_claude(PROMPT_DOC_LINES, [block])
-                invoice = extract_json(raw_inv) or {}
-                if not invoice:
-                    st.warning("Kon de factuur niet gestructureerd lezen; "
-                               "de vergelijking met de factuur wordt overgeslagen.")
+            def _read_source(f=None, text=None, label=""):
+                """Return (items, totals, header) for one source, or None."""
+                if f is not None and audit.is_spreadsheet(f.name):
+                    f.seek(0)
+                    items, totals, colmap, notes = audit.parse_prep_file(f.read(), f.name)
+                    if not items:
+                        st.warning(f"{label}: geen regels herkend in het bestand."
+                                   + (" " + "; ".join(notes) if notes else ""))
+                        return None
+                    return items, totals, {"source": f.name, "reader": "spreadsheet"}
+                content = []
+                if f is not None:
+                    try:
+                        content.append(build_file_block(f))
+                    except Exception as e:
+                        st.error(f"{label}: bestand kon niet worden verwerkt: "
+                                 f"{type(e).__name__}: {e}")
+                        return None
+                if text:
+                    content.append({"type":"text","text":"Document text:\n" + text.strip()})
+                if not content:
+                    return None
+                with st.spinner(f"Reading {label.lower()}..."):
+                    raw = call_claude(PROMPT_DOC_LINES, content, step="doc_reader")
+                doc = extract_json(raw) or {}
+                items = audit.items_from_doc_lines(doc.get("line_items"))
+                if not items:
+                    st.warning(f"{label}: geen goederenregels herkend.")
+                    for w in doc.get("warnings", []):
+                        st.markdown(f"- {w}")
+                    return None
+                header = {k: doc.get(k, "") for k in
+                          ("document_type","document_number","document_date","currency",
+                           "incoterm","country_of_origin","origin_statement","seller","buyer")}
+                header.update({"source": getattr(f, "name", "pasted text"), "reader": "AI"})
+                header["excluded_lines"] = doc.get("excluded_lines", [])
+                header["warnings"] = doc.get("warnings", [])
+                return items, audit.totals_from_stated(doc.get("stated_totals")), header
 
-            st.session_state.audit_items   = items
-            st.session_state.audit_totals  = totals
-            st.session_state.audit_invoice = invoice
+            sources = []
+            for f, txt, label in ((src_a, None, "Source A"),
+                                  (src_b, None, "Source B"),
+                                  (None, pasted, "Pasted text")):
+                if f is None and not (txt and txt.strip()):
+                    continue
+                got = _read_source(f, txt, label)
+                if got:
+                    sources.append({"label": label, "items": got[0],
+                                    "totals": got[1], "header": got[2]})
+            if not sources:
+                st.error("Geen bruikbare regels gevonden in de aangeleverde bronnen.")
+                st.stop()
+
+            # The source carrying goods codes is the one being audited; a second
+            # source becomes the cross-check. With equal coverage, the first wins.
+            sources.sort(key=lambda s: audit.code_coverage(s["items"]), reverse=True)
+            declared, cross = sources[0], (sources[1] if len(sources) > 1 else None)
+
+            header = declared["header"]
+            cross_header = cross["header"] if cross else {}
+            st.session_state.audit_items   = declared["items"]
+            st.session_state.audit_totals  = declared["totals"]
+            st.session_state.audit_invoice = {
+                **cross_header,
+                "line_items": audit.items_to_doc_lines(cross["items"]) if cross else [],
+                "stated_totals": (cross["totals"].get("grand") if cross else {}) or {},
+            } if cross else {}
             st.session_state.audit_batch   = str(uuid.uuid4())[:8]
             st.session_state.audit_meta    = {
-                "notes": notes, "colmap": colmap, "context": ctx_txt,
-                "currency": (currency or invoice.get("currency","") or "").strip(),
-                "rate": rate.strip(), "incoterm": (incoterm or invoice.get("incoterm","") or "").strip(),
+                "context": ctx_txt,
+                "currency": (currency or header.get("currency","")
+                             or cross_header.get("currency","") or "").strip(),
+                "rate": rate.strip(),
+                "incoterm": (incoterm or header.get("incoterm","")
+                             or cross_header.get("incoterm","") or "").strip(),
                 "freight": freight.strip(), "insurance": insurance.strip(),
-                "other": other_add.strip(), "prep_name": prep_file.name,
+                "other": other_add.strip(),
+                "prep_name": header.get("source",""),
+                "reader": header.get("reader",""),
+                "cross_name": cross_header.get("source","") if cross else "",
+                "origin": header.get("country_of_origin","") or cross_header.get("country_of_origin",""),
+                "origin_statement": header.get("origin_statement","") or cross_header.get("origin_statement",""),
+                "doc_number": header.get("document_number","") or cross_header.get("document_number",""),
+                "single_source": cross is None,
+                "code_coverage": audit.code_coverage(declared["items"]),
             }
             st.session_state.audit_stage = "review"
             st.rerun()
@@ -1292,15 +1512,30 @@ elif st.session_state.page == "audit":
         c3.metric("Warnings", summary["warnings"])
         c4.metric("Notes", summary["infos"])
 
-        if invoice:
-            bits = [invoice.get("document_number",""), invoice.get("document_date",""),
-                    invoice.get("currency",""), invoice.get("incoterm",""),
-                    invoice.get("country_of_origin","")]
-            st.markdown("<span style='color:#888;font-size:0.82rem;'>Invoice: "
-                        + " · ".join(b for b in bits if b) + "</span>", unsafe_allow_html=True)
-            if invoice.get("origin_statement"):
-                st.markdown(f"<span style='color:#888;font-size:0.8rem;'>Origin statement: "
-                            f"{invoice['origin_statement'][:200]}</span>", unsafe_allow_html=True)
+        src_line = f"Audited: {meta.get('prep_name','—')} ({meta.get('reader','')})"
+        if meta.get("cross_name"):
+            src_line += f" · cross-checked against {meta['cross_name']}"
+        for extra in (meta.get("doc_number"), meta.get("currency"),
+                      meta.get("incoterm"), meta.get("origin")):
+            if extra:
+                src_line += f" · {extra}"
+        st.markdown(f"<span style='color:#888;font-size:0.82rem;'>{src_line}</span>",
+                    unsafe_allow_html=True)
+        if meta.get("origin_statement"):
+            st.markdown(f"<span style='color:#888;font-size:0.8rem;'>Origin statement: "
+                        f"{meta['origin_statement'][:200]}</span>", unsafe_allow_html=True)
+
+        if meta.get("single_source"):
+            st.info("Only one source was provided, so figures could not be compared between "
+                    "documents. Internal consistency (line amounts, totals, weights, code "
+                    "format) is still fully checked.")
+        if meta.get("reader") == "AI":
+            st.markdown("<span style='color:#888;font-size:0.8rem;'>The audited lines were read "
+                        "from a document by the AI reader. Spot-check the figures below against "
+                        "the original before relying on them.</span>", unsafe_allow_html=True)
+        if not meta.get("code_coverage"):
+            st.warning("No goods codes were found on the audited source. The arithmetic checks "
+                       "still apply; the code comparison will show DKM's own classification only.")
 
         st.divider()
 
@@ -1408,7 +1643,7 @@ elif st.session_state.page == "audit":
                     level     = audit.compare_codes(it["hs_code"], own_taric or own_cn)
 
                     compare = {}
-                    if level not in ("identical",) and own_cn:
+                    if it["hs_code"] and level != "identical" and own_cn:
                         cmp_input = (
                             f"Product data:\n{json.dumps(json1, indent=2) if json1 else it['product']}\n\n"
                             f"Declared code in preparation file: {it['hs_code']}\n\n"
@@ -1416,7 +1651,8 @@ elif st.session_state.page == "audit":
                             f"Engine confidence: {(json2 or {}).get('confidence','')}\n\n"
                             f"Engine reasoning:\n{raw2[:4000]}")
                         try:
-                            compare = extract_json(call_claude(PROMPT_CODE_COMPARE, cmp_input)) or {}
+                            compare = extract_json(call_claude(PROMPT_CODE_COMPARE, cmp_input,
+                                                              step="code_compare")) or {}
                         except Exception:
                             compare = {}
 
@@ -1429,7 +1665,10 @@ elif st.session_state.page == "audit":
                                 {**(json3 or {}), "issues": issues},
                                 raw1, raw2, raw3, tree,
                                 row_id_override=row_id,
-                                desc_prefix=f"[AUDIT {batch} {n}/{total}] ", quiet=True)
+                                desc_prefix=f"[AUDIT {batch} {n}/{total}] ", quiet=True,
+                                batch_id=batch, source="audit",
+                                declared_code=it["hs_code"],
+                                agreement=audit.AGREEMENT_LABELS.get(level,("?",""))[0])
 
                     st.session_state.audit_opinions.append({
                         "row_id": row_id, "product": it["product"], "declared": it["hs_code"],
@@ -1450,10 +1689,13 @@ elif st.session_state.page == "audit":
             agree = len([o for o in ok if o["level"] == "identical"])
             minor = len([o for o in ok if o["level"] in ("taric","subheading")])
             major = len([o for o in ok if o["level"] in ("heading","chapter","different")])
-            m1, m2, m3 = st.columns(3)
+            _ac = pricing.summarize_events(
+                [e for e in st.session_state.usage_events if e.get("batch_id") == batch])
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("Identical", agree)
             m2.metric("Minor difference", minor)
             m3.metric("Substantive difference", major)
+            m4.metric("AI cost", pricing.fmt_usd(_ac["cost_usd"]))
 
             st.dataframe([{
                 "Product": o["product"][:40],
@@ -1540,8 +1782,11 @@ elif st.session_state.page == "review":
         st.stop()
 
     try:
-        sid, sac  = get_secrets()
-        pending   = get_pending_reviews(sid, sac)
+        if neon_dsn() and ensure_schema():
+            pending = neon.get_pending_reviews(neon_dsn())
+        else:
+            sid, sac = get_secrets()
+            pending  = get_pending_reviews(sid, sac)
     except Exception as e:
         st.error(f"Could not load reviews: {e}")
         st.stop()
@@ -1600,12 +1845,21 @@ elif st.session_state.page == "review":
 
             if st.button("✔  Submit review", key=f"submit_{idx}_{row_id}"):
                 try:
-                    save_senior_review(
-                        row_id=row_id, verdict=verdict, comment=comment,
-                        senior_user=st.session_state.username,
-                        cn_code=cn, taric_code=taric, description=desc,
-                        spreadsheet_id=sid, service_account_info=sac,
-                    )
+                    if neon_dsn() and ensure_schema():
+                        from utils.sheets import _make_fingerprint
+                        neon.save_senior_review(
+                            neon_dsn(), row_id=row_id, verdict=verdict, comment=comment,
+                            senior_user=st.session_state.username,
+                            cn_code=cn, taric_code=taric, description=desc,
+                            fingerprint=_make_fingerprint(desc))
+                    if sheets_configured():
+                        sid, sac = get_secrets()
+                        save_senior_review(
+                            row_id=row_id, verdict=verdict, comment=comment,
+                            senior_user=st.session_state.username,
+                            cn_code=cn, taric_code=taric, description=desc,
+                            spreadsheet_id=sid, service_account_info=sac,
+                        )
                     st.success(f"✓ Review saved — {verdict}")
                     st.rerun()
                 except Exception as e:
@@ -1622,8 +1876,11 @@ elif st.session_state.page == "history":
     st.divider()
 
     try:
-        sid, sac = get_secrets()
-        all_rows = get_all_history(sid, sac)
+        if neon_dsn() and ensure_schema():
+            all_rows = neon.get_all_history(neon_dsn())
+        else:
+            sid, sac = get_secrets()
+            all_rows = get_all_history(sid, sac)
     except Exception as e:
         st.error(f"Could not load history: {e}")
         st.stop()
@@ -1665,6 +1922,71 @@ elif st.session_state.page == "history":
         filtered = filtered[filtered.get("senior_reviewed","no").str.lower() == "yes"]
 
     display_cols = ["timestamp","user","description","cn_code","taric_code",
-                    "confidence","outcome","senior_reviewed","senior_verdict","senior_user"]
+                    "confidence","outcome","cost_usd","senior_reviewed","senior_verdict","senior_user"]
     available = [c for c in display_cols if c in filtered.columns]
     st.dataframe(filtered[available], use_container_width=True, height=400)
+
+    # ── AI cost ───────────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("## AI cost")
+
+    if "cost_usd" in df.columns:
+        spent = float(pd.to_numeric(df["cost_usd"], errors="coerce").fillna(0).sum())
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Logged classifications", total)
+        k2.metric("Total cost", pricing.fmt_usd(spent))
+        k3.metric("Average per line", pricing.fmt_usd(spent / total if total else 0))
+
+    if not neon_dsn():
+        st.info("Detailed cost analytics (per day, per user, per pipeline step) require the "
+                "Neon backend. Add NEON_DATABASE_URL to your secrets to enable it.")
+    else:
+        days = st.selectbox("Period", [7, 30, 90, 365], index=1,
+                            format_func=lambda d: f"last {d} days")
+        try:
+            u = neon.usage_summary(neon_dsn(), days)
+        except Exception as e:
+            st.warning(f"Kon verbruiksgegevens niet ophalen: {type(e).__name__}: {e}")
+            u = None
+        if u:
+            t = u["totals"]
+            eur = pricing.fmt_eur(t.get("cost", 0), usd_per_eur())
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("API calls", f"{int(t.get('calls',0)):,}")
+            c2.metric("Cost", pricing.fmt_usd(t.get("cost", 0)), eur or None)
+            c3.metric("Input tokens", f"{int(t.get('input_tokens',0)):,}")
+            c4.metric("Output tokens", f"{int(t.get('output_tokens',0)):,}")
+
+            if u["by_day"]:
+                dfd = pd.DataFrame(u["by_day"])
+                dfd["cost"] = dfd["cost"].astype(float)
+                st.markdown("##### Cost per day")
+                st.bar_chart(dfd.set_index("day")["cost"], height=200)
+
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                st.markdown("##### Per user")
+                st.dataframe([{"User": r["app_user"] or "—", "Calls": int(r["calls"]),
+                               "Cost": pricing.fmt_usd(r["cost"])} for r in u["by_user"]],
+                             use_container_width=True)
+            with cc2:
+                st.markdown("##### Per pipeline step")
+                st.dataframe([{"Model": r["model"], "Step": r["step"],
+                               "Calls": int(r["calls"]), "Cost": pricing.fmt_usd(r["cost"])}
+                              for r in u["by_model"]], use_container_width=True)
+
+            try:
+                dossiers = neon.cost_per_dossier(neon_dsn())
+            except Exception:
+                dossiers = []
+            if dossiers:
+                st.markdown("##### Cost per dossier")
+                st.dataframe([{"Batch": d["batch_id"], "Started": d["started"],
+                               "Lines": int(d["lines"]), "Cost": pricing.fmt_usd(d["cost"]),
+                               "Per line": pricing.fmt_usd(float(d["cost"])/max(1,int(d["lines"])))}
+                              for d in dossiers], use_container_width=True)
+
+    st.markdown(f"<span style='color:#666;font-size:0.76rem;'>Costs are estimates computed from "
+                f"token counts returned by the API, priced with the table in utils/pricing.py "
+                f"(rates checked {pricing.PRICING_VERIFIED}). The authoritative figure is the "
+                f"Anthropic Console usage dashboard.</span>", unsafe_allow_html=True)
