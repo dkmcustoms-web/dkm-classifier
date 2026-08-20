@@ -3,7 +3,9 @@
     "allow": [
       "Bash(python -c ' *)",
       "Bash(rm -f eval/runs/realistic_300__sonnet420250514.jsonl)",
-      "Bash(python eval/run_baseline.py --testset eval/testsets/realistic_300.jsonl --limit 2)"
+      "Bash(python eval/run_baseline.py --testset eval/testsets/realistic_300.jsonl --limit 2)",
+      "Bash(cd \"c:/Users/Luc/.Github/Healthcertificatechecker\" && cat db/connection.py 2>/dev/null | head -60 && echo \"==== requirements ====\" && cat requirements.txt)",
+      "Read(//c/Users/Luc/.Github/Healthcertificatechecker/**)"
     ]
   }
 }
