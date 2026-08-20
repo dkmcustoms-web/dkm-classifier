@@ -1,0 +1,32 @@
+# Secrets — NOOIT op GitHub!
+.streamlit/secrets.toml
+*.env
+.env
+
+# Data & indexen (te groot voor git)
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Eval-resultaten
+eval/runs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Uploads
+*.jpg
+*.jpeg
+*.png
+*.pdf
