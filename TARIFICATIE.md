@@ -89,23 +89,61 @@ twijfel gaan:
 Zit `HIGH` even vaak fout als `LOW`, dan draagt het label geen informatie en
 hoort het niet in de interface.
 
+## Opslag — Neon in plaats van een bestand naast de app
+
+Streamlit Cloud heeft geen plek voor een index van gigabytes, maar wel een
+netwerkverbinding. De index staat dus in Neon, waar de app al voor
+[classificaties en verbruik](utils/db.py) op aansluit.
+
+**Werkverdeling:**
+
+| Waar | Wat | Omvang |
+|---|---|---|
+| Neon | 123.067 geldige BTI's, voluit doorzoekbaar | ~350 MB geschat |
+| Neon | `bti_code_stats` — samenvatting per CN8 over **het volledige archief** | 14.455 rijen, enkele MB |
+| lokaal SQLite | alle 1.044.971 records, voor onderzoek en testsets | 2,06 GB |
+
+Zo gaat er niets verloren. De 922k verlopen BTI's tellen mee in de
+onderbouwing zonder dat ze zelf naar Neon hoeven. Voorbeeld: CN8 `63079098`
+heeft 2.164 geldige BTI's uit 23 lidstaten plus 8.717 verlopen uit 28 — dat is
+precies de zin die "MEDIUM confidence" moet vervangen.
+
+```bash
+python scripts/load_neon.py --check          # verbinding + opslag rapporteren
+python scripts/load_neon.py                  # geldige BTI's + CN8-samenvatting
+python scripts/load_neon.py --code-stats     # alleen de samenvatting herberekenen
+python scripts/load_neon.py --include-expired  # alles (~2 GB in Neon)
+```
+
+Reken voor fase 3 op ongeveer 1 GB in totaal: embeddings over de geldige set
+komen daar nog bij (123k × 1024 dimensies als `halfvec` ≈ 250 MB, plus een
+vergelijkbare HNSW-index). Controleer in de Neon-console of je plan dat trekt.
+
+**Let op bij de gepoolde endpoint:** psycopg3 maakt na vijf uitvoeringen
+automatisch prepared statements aan, en Neon's pooler is PgBouncer in
+transaction mode — die kan een volgende query naar een andere serververbinding
+sturen waar dat statement niet bestaat. [tariff/neon.py](tariff/neon.py) zet
+daarom `prepare_threshold=None`. Voor [utils/db.py](utils/db.py) is dat het
+overwegen waard bij `log_usage_events`, dat `executemany` gebruikt.
+
 ## Openstaande beslissingen
 
-**Omvang versus Streamlit Cloud.** De volledige database is 2,06 GB; de geldige
-BTI's alleen zijn ongeveer 300 MB. Streamlit Cloud trekt de volledige set niet.
-Voorstel: het volledige archief blijft lokaal (voor onderzoek en testsets), de
-app krijgt de geldige set mee. Verlopen BTI's kunnen later als compacte
-precedentlaag per CN8 terugkomen — tellingen plus een paar representatieve
-voorbeelden, dat is klein.
-
-**Meertalig zoeken.** De huidige zoekfunctie is lexicaal (SQLite FTS5). Die
-werkt goed bij gedeelde woordenschat ("aluminium", "lithium") maar vindt met een
-Nederlandse omschrijving geen Duitse BTI — en 61% van de geldige BTI's is Duits.
-Semantisch zoeken bovenop de lexicale laag hoort bij fase 3.
+**Meertalig zoeken.** Het zoeken is nu lexicaal: SQLite FTS5 lokaal, Postgres
+full-text search in Neon (per taal geconfigureerd, dus Duitse stemming voor
+Duitse BTI's). Dat werkt binnen een taal goed en over talen heen matig — met een
+Nederlandse omschrijving vind je geen Duitse BTI, en 61% van de geldige BTI's is
+Duits. Semantisch zoeken erbovenop hoort bij fase 3 en vraagt een
+embeddingsleverancier (Anthropic heeft geen embeddings-API; Voyage AI is de
+aanbevolen partner).
 
 **Bron voor de nomenclatuur.** Nodig voor fase 2. DDS2 publiceert
 nomenclatuurextracties naast EBTI; welke download precies bruikbaar is, moet nog
 uitgezocht worden.
+
+**DKM's eigen data.** De tabel `verified_codes` in [utils/db.py](utils/db.py)
+bevat door senioren bevestigde codes. Dat is de betrouwbaarste bron die er is —
+eigen dossiers, eigen vakmensen — en hoort als eigen laag in de onderbouwing,
+zwaarder wegend dan een BTI van een andere lidstaat.
 
 ## Juridische nuance
 

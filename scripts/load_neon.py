@@ -50,6 +50,9 @@ def main() -> int:
                     help="ook verlopen BTI's laden (veel meer opslag)")
     ap.add_argument("--check", action="store_true",
                     help="alleen verbinding en opslag rapporteren")
+    ap.add_argument("--code-stats", action="store_true",
+                    help="alleen de samenvatting per CN8 herberekenen "
+                         "(telt het volledige archief mee, ook verlopen BTI's)")
     ap.add_argument("--batch", type=int, default=2000)
     args = ap.parse_args()
 
@@ -76,6 +79,13 @@ def main() -> int:
         raise SystemExit(f"Lokale index ontbreekt: {args.sqlite}\n"
                          f"Draai eerst: python scripts/import_ebti.py --source <EBTI-map>")
 
+    if args.code_stats:
+        started = time.time()
+        n = neon.load_code_stats(dsn, args.sqlite)
+        print(f"{n:,} CN8-samenvattingen geladen in {time.time()-started:.1f}s "
+              f"(volledig archief, incl. verlopen BTI's)")
+        return 0
+
     valid_only = not args.include_expired
     scope = "geldige BTI's" if valid_only else "alle BTI's (incl. verlopen)"
     print(f"Laden naar Neon: {scope}")
@@ -88,6 +98,11 @@ def main() -> int:
 
     total = neon.load_from_sqlite(dsn, args.sqlite, valid_only=valid_only,
                                   batch=args.batch, progress=progress)
+
+    # De samenvatting per CN8 dekt altijd het volledige archief, ook wanneer
+    # alleen de geldige BTI's naar Neon gaan.
+    stats_rows = neon.load_code_stats(dsn, args.sqlite)
+    print(f"  {stats_rows:,} CN8-samenvattingen (volledig archief)")
 
     print(f"\n{total:,} records geladen in {(time.time()-started)/60:.1f} min")
     for key, value in neon.storage_report(dsn).items():
